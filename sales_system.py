@@ -3,50 +3,86 @@ import pandas as pd
 import os
 import bcrypt
 from datetime import datetime
-from sqlalchemy import create_engine, Column, String, Integer, Float, DateTime, ForeignKey, Text, or_
+from sqlalchemy import create_engine, Column, String, Integer, Float, DateTime, ForeignKey, or_, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy import func, update
 import cloudinary
 import cloudinary.uploader
 import plotly.express as px
 from fpdf import FPDF
 import io
-import base64
-from dotenv import load_dotenv
+import tempfile
 
-load_dotenv()  # Đọc biến môi trường từ .env
-
-# ---------- CẤU HÌNH ----------
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///sales.db")
-if "sqlite" in DATABASE_URL:
-    st.warning("⚠️ Bạn đang dùng SQLite. SQLite **không hỗ trợ row lock** thực sự, có thể gây race condition khi nhiều người dùng. Hãy chuyển sang PostgreSQL cho production.")
-    # SQLite không hỗ trợ with_for_update, sẽ bỏ qua lock
-    use_row_lock = False
+# ---------- CẤU HÌNH DATABASE (TỰ ĐỘNG PHÁT HIỆN CLOUD) ----------
+# Nếu đang chạy trên Streamlit Cloud hoặc không có file sales.db ở thư mục hiện tại -> dùng /tmp
+if os.environ.get('STREAMLIT_CLOUD') or os.environ.get('STREAMLIT_RUNTIME') or not os.path.exists('sales.db'):
+    DB_PATH = os.path.join(tempfile.gettempdir(), 'sales.db')
 else:
-    use_row_lock = True
+    DB_PATH = 'sales.db'
 
-# Cloudinary
-CLOUD_NAME = os.getenv("CLOUD_NAME")
-API_KEY = os.getenv("API_KEY")
-API_SECRET = os.getenv("API_SECRET")
-if not all([CLOUD_NAME, API_KEY, API_SECRET]):
-    st.error("❌ Thiếu cấu hình Cloudinary. Vui lòng set biến môi trường CLOUD_NAME, API_KEY, API_SECRET")
-    st.stop()
-
-cloudinary.config(
-    cloud_name=CLOUD_NAME,
-    api_key=API_KEY,
-    api_secret=API_SECRET
+DATABASE_URL = f"sqlite:///{DB_PATH}"
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False},
+    pool_size=20,
+    max_overflow=30,
+    pool_pre_ping=True,
+    echo=False
 )
-
-# ---------- KHỞI TẠO DATABASE VỚI SQLALCHEMY ----------
-Base = declarative_base()
-engine = create_engine(DATABASE_URL, echo=False, future=True)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
-# Định nghĩa models
+# ---------- CLOUDINARY (DÙNG SECRETS HOẶC HARDCODE TẠM) ----------
+if os.environ.get('STREAMLIT_CLOUD') or os.environ.get('STREAMLIT_RUNTIME'):
+    try:
+        CLOUD_NAME = st.secrets["CLOUD_NAME"]
+        API_KEY = st.secrets["API_KEY"]
+        API_SECRET = st.secrets["API_SECRET"]
+    except:
+        st.error("❌ Thiếu Cloudinary secrets. Vui lòng cấu hình trên Streamlit Cloud.")
+        st.stop()
+else:
+    # Thay bằng thông tin thật của bạn (nếu chạy local)
+    CLOUD_NAME = "dw6f9wege"
+    API_KEY = "353532489943778"
+    API_SECRET = "cZWPsYQBsJ-y5g2fXLj8WUW7X-w"
+
+cloudinary.config(cloud_name=CLOUD_NAME, api_key=API_KEY, api_secret=API_SECRET)
+
+# ---------- CSS GIAO DIỆN ĐẸP ----------
+st.markdown("""
+<style>
+.block-container { padding-top: 1rem; }
+.stButton button {
+    border-radius: 10px;
+    background-color: #4CAF50;
+    color: white;
+    font-weight: bold;
+    border: none;
+    transition: 0.2s;
+}
+.stButton button:hover { background-color: #45a049; }
+.product-card {
+    background: linear-gradient(145deg, #2c2c2c, #1f1f1f);
+    border-radius: 15px;
+    padding: 15px;
+    text-align: center;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.3);
+    margin-bottom: 15px;
+}
+.price { font-size: 1.3em; color: #4CAF50; font-weight: bold; }
+.stock { color: #ff9800; }
+.cart-item {
+    background: #1e1e1e;
+    border-radius: 10px;
+    padding: 10px;
+    margin-bottom: 5px;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ---------- MODELS ----------
+Base = declarative_base()
+
 class User(Base):
     __tablename__ = 'users'
     username = Column(String, primary_key=True)
@@ -94,582 +130,479 @@ class Setting(Base):
     key = Column(String, primary_key=True)
     value = Column(String)
 
-# Tạo bảng
 Base.metadata.create_all(engine)
 
 # ---------- HÀM TIỆN ÍCH ----------
-def hash_password(pwd: str) -> str:
-    return bcrypt.hashpw(pwd.encode(), bcrypt.gensalt()).decode()
-
-def verify_password(pwd: str, hashed: str) -> bool:
-    return bcrypt.checkpw(pwd.encode(), hashed.encode())
+def hash_password(pwd): return bcrypt.hashpw(pwd.encode(), bcrypt.gensalt()).decode()
+def verify_password(pwd, hashed): return bcrypt.checkpw(pwd.encode(), hashed.encode())
 
 def init_data():
-    with SessionLocal() as session:
-        if not session.query(User).filter_by(username='admin').first():
-            admin = User(username='admin', password_hash=hash_password('admin123'), role='admin')
-            staff = User(username='staff', password_hash=hash_password('staff123'), role='staff')
-            session.add_all([admin, staff])
-        defaults = {
-            'loyal_min_spent': '5000000', 'loyal_min_purchases': '10',
-            'longtime_min_spent': '2000000', 'longtime_min_purchases': '5',
-            'loyal_discount': '5', 'longtime_discount': '2', 'regular_discount': '0'
-        }
-        for k, v in defaults.items():
-            if not session.query(Setting).filter_by(key=k).first():
-                session.add(Setting(key=k, value=v))
-        session.commit()
-
+    with SessionLocal() as s:
+        if not s.query(User).filter_by(username='admin').first():
+            s.add_all([User(username='admin', password_hash=hash_password('admin123'), role='admin'),
+                       User(username='staff', password_hash=hash_password('staff123'), role='staff')])
+        defaults = {'loyal_min_spent':'5000000','loyal_min_purchases':'10','longtime_min_spent':'2000000',
+                    'longtime_min_purchases':'5','loyal_discount':'5','longtime_discount':'2','regular_discount':'0'}
+        for k,v in defaults.items():
+            if not s.query(Setting).filter_by(key=k).first():
+                s.add(Setting(key=k, value=v))
+        s.commit()
 init_data()
 
-def login(username, password):
-    with SessionLocal() as session:
-        user = session.query(User).filter_by(username=username).first()
-        if user and verify_password(password, user.password_hash):
-            return user.role
-    return None
+def upload_image(file): return cloudinary.uploader.upload(file, folder="sales_app")['secure_url']
 
-def upload_image_to_cloudinary(image_file):
-    result = cloudinary.uploader.upload(image_file, folder="sales_app")
-    return result['secure_url']
+@st.cache_data(ttl=5, show_spinner=False)
+def get_products(search=""):
+    with SessionLocal() as s:
+        q = s.query(Product)
+        if search: q = q.filter(or_(Product.name.contains(search), Product.barcode.contains(search)))
+        return [{'id':p.id,'name':p.name,'price':p.price,'stock':p.stock,'image_url':p.image_url,'barcode':p.barcode} for p in q.all()]
 
-def add_product(name, price, stock, image_file, barcode=None):
-    with SessionLocal() as session:
-        image_url = upload_image_to_cloudinary(image_file) if image_file else ""
-        product = Product(name=name, price=price, stock=stock, image_url=image_url, barcode=barcode)
-        session.add(product)
-        session.commit()
-
-def update_product(product_id, name, price, stock, image_file=None, barcode=None):
-    with SessionLocal() as session:
-        product = session.query(Product).filter_by(id=product_id).first()
-        if product:
-            product.name = name
-            product.price = price
-            product.stock = stock
-            if barcode:
-                product.barcode = barcode
-            if image_file:
-                product.image_url = upload_image_to_cloudinary(image_file)
-            session.commit()
-
-def delete_product(product_id):
-    with SessionLocal() as session:
-        session.query(Product).filter_by(id=product_id).delete()
-        session.commit()
-
-def get_all_products(search_term=""):
-    with SessionLocal() as session:
-        query = session.query(Product)
-        if search_term:
-            query = query.filter(
-                or_(
-                    Product.name.contains(search_term),
-                    Product.barcode.isnot(None),
-                    Product.barcode.contains(search_term)
-                )
-            )
-        products = query.all()
-    return products
-
+@st.cache_data(ttl=5, show_spinner=False)
 def get_customers():
-    with SessionLocal() as session:
-        customers = session.query(Customer).all()
-    return customers
+    with SessionLocal() as s: return [{'id':c.id,'name':c.name,'phone':c.phone,'total_spent':c.total_spent,'total_purchases':c.total_purchases,'type':c.type} for c in s.query(Customer).all()]
 
-def add_customer(name, phone):
-    with SessionLocal() as session:
-        cust = Customer(name=name, phone=phone)
-        session.add(cust)
-        session.commit()
+@st.cache_data(ttl=5, show_spinner=False)
+def get_loyal(): return [{'name':c.name,'phone':c.phone,'total_spent':c.total_spent} for c in SessionLocal().query(Customer).filter_by(type='loyal').all()]
 
-def update_customer_type(customer_id):
-    with SessionLocal() as session:
-        cust = session.query(Customer).filter_by(id=customer_id).first()
-        if cust:
-            loyal_spent = float(session.query(Setting).filter_by(key='loyal_min_spent').first().value)
-            loyal_pur = int(session.query(Setting).filter_by(key='loyal_min_purchases').first().value)
-            longtime_spent = float(session.query(Setting).filter_by(key='longtime_min_spent').first().value)
-            longtime_pur = int(session.query(Setting).filter_by(key='longtime_min_purchases').first().value)
-            
-            if cust.total_spent >= loyal_spent and cust.total_purchases >= loyal_pur:
-                cust.type = 'loyal'
-            elif cust.total_spent >= longtime_spent and cust.total_purchases >= longtime_pur:
-                cust.type = 'longtime'
-            else:
-                cust.type = 'regular'
-            session.commit()
+@st.cache_data(ttl=5, show_spinner=False)
+def get_vip(limit=10): return [{'name':c.name,'phone':c.phone,'total_spent':c.total_spent,'type':c.type} for c in SessionLocal().query(Customer).order_by(Customer.total_spent.desc()).limit(limit).all()]
 
-def get_discount_for_customer(customer_id):
-    with SessionLocal() as session:
-        cust = session.query(Customer).filter_by(id=customer_id).first()
-        if not cust:
-            return 0
-        key = f"{cust.type}_discount"
-        disc = float(session.query(Setting).filter_by(key=key).first().value)
-    return disc
+@st.cache_data(ttl=5, show_spinner=False)
+def get_sales(): return [{'id':s.id,'date':s.date,'final_amount':s.final_amount} for s in SessionLocal().query(Sale).all()]
 
-def get_loyal_customers():
-    with SessionLocal() as session:
-        customers = session.query(Customer).filter_by(type='loyal').all()
-    return customers
+@st.cache_data(ttl=5, show_spinner=False)
+def get_top_products():
+    with SessionLocal() as s:
+        items = s.query(SaleItem.product_id, func.sum(SaleItem.quantity).label('qty')).group_by(SaleItem.product_id).all()
+        if not items: return []
+        prods = s.query(Product).filter(Product.id.in_([i[0] for i in items])).all()
+        pmap = {p.id:p.name for p in prods}
+        return sorted([{'name':pmap[pid],'total_qty':qty} for pid,qty in items], key=lambda x:x['total_qty'], reverse=True)[:10]
 
-def get_top_vip_customers(limit=10):
-    with SessionLocal() as session:
-        customers = session.query(Customer).order_by(Customer.total_spent.desc()).limit(limit).all()
-    return customers
+@st.cache_data(ttl=5, show_spinner=False)
+def get_settings(): return {k.value:v.value for k,v in SessionLocal().query(Setting).all()}
 
-def record_sale(customer_id, cart_items, discount_percent):
-    """
-    cart_items: list of (product_id, quantity, price)
-    Sử dụng row lock nếu database hỗ trợ (PostgreSQL)
-    """
-    with SessionLocal() as session:
+def clear_cache(): st.cache_data.clear()
+
+# ---------------- NGHIỆP VỤ GHI ----------------
+def add_product(name,price,stock,img,barcode):
+    with SessionLocal() as s:
+        s.add(Product(name=name,price=price,stock=stock,image_url=upload_image(img) if img else "",barcode=barcode))
+        s.commit()
+    clear_cache()
+
+def update_product(pid,name,price,stock,img,barcode):
+    with SessionLocal() as s:
+        p = s.query(Product).get(pid)
+        if p:
+            p.name, p.price, p.stock, p.barcode = name, price, stock, barcode
+            if img: p.image_url = upload_image(img)
+            s.commit()
+    clear_cache()
+
+def delete_product(pid):
+    with SessionLocal() as s:
+        s.query(Product).filter_by(id=pid).delete()
+        s.commit()
+    clear_cache()
+
+def add_customer(name,phone):
+    with SessionLocal() as s:
+        s.add(Customer(name=name,phone=phone))
+        s.commit()
+    clear_cache()
+
+def update_customer_type(cid):
+    with SessionLocal() as s:
+        c = s.query(Customer).get(cid)
+        if c:
+            sets = get_settings()
+            loyal_spent = float(sets.get('loyal_min_spent',5000000))
+            loyal_pur = int(sets.get('loyal_min_purchases',10))
+            longtime_spent = float(sets.get('longtime_min_spent',2000000))
+            longtime_pur = int(sets.get('longtime_min_purchases',5))
+            if c.total_spent >= loyal_spent and c.total_purchases >= loyal_pur: c.type = 'loyal'
+            elif c.total_spent >= longtime_spent and c.total_purchases >= longtime_pur: c.type = 'longtime'
+            else: c.type = 'regular'
+            s.commit()
+    clear_cache()
+
+def get_discount(cid):
+    with SessionLocal() as s:
+        c = s.query(Customer).get(cid)
+        if not c: return 0
+        return float(get_settings().get(f"{c.type}_discount",0))
+
+def record_sale(cid, cart_items, disc_percent):
+    with SessionLocal() as s:
         try:
-            # Kiểm tra tồn kho và khóa hàng
-            for pid, qty, price in cart_items:
-                if use_row_lock:
-                    product = session.query(Product).filter_by(id=pid).with_for_update().first()
-                else:
-                    product = session.query(Product).filter_by(id=pid).first()
-                if not product or product.stock < qty:
-                    raise ValueError(f"Sản phẩm {product.name if product else '?'} không đủ hàng")
-            
-            total = sum(q * p for _, q, p in cart_items)
-            discount_amount = total * discount_percent / 100
-            final = total - discount_amount
-            
-            sale = Sale(customer_id=customer_id, total_amount=total, discount=discount_amount, final_amount=final)
-            session.add(sale)
-            session.flush()
-            
-            for pid, qty, price in cart_items:
-                item = SaleItem(sale_id=sale.id, product_id=pid, quantity=qty, price=price)
-                session.add(item)
-                session.query(Product).filter_by(id=pid).update({Product.stock: Product.stock - qty})
-            
-            cust = session.query(Customer).filter_by(id=customer_id).first()
-            cust.total_spent += final
-            cust.total_purchases += 1
-            session.commit()
-            
-            update_customer_type(customer_id)  # Cập nhật loại sau khi commit
-            return sale.id, final, discount_amount
+            for pid,qty,price in cart_items:
+                p = s.query(Product).get(pid)
+                if not p or p.stock < qty:
+                    raise ValueError(f"Sản phẩm {p.name if p else '?'} không đủ hàng")
+            total = sum(q*p for _,q,p in cart_items)
+            disc_amt = total * disc_percent / 100
+            final = total - disc_amt
+            sale = Sale(customer_id=cid, total_amount=total, discount=disc_amt, final_amount=final)
+            s.add(sale)
+            s.flush()
+            for pid,qty,price in cart_items:
+                s.add(SaleItem(sale_id=sale.id, product_id=pid, quantity=qty, price=price))
+                s.query(Product).filter_by(id=pid).update({Product.stock: Product.stock - qty})
+            c = s.query(Customer).get(cid)
+            c.total_spent += final
+            c.total_purchases += 1
+            s.commit()
+            update_customer_type(cid)
+            clear_cache()
+            return sale.id, final, disc_amt
         except Exception as e:
-            session.rollback()
+            s.rollback()
             raise e
 
-def upload_customers_csv(file):
+def upload_csv(file):
     df = pd.read_csv(file)
-    with SessionLocal() as session:
-        for _, row in df.iterrows():
-            name = row.get('name')
-            phone = str(row.get('phone'))
-            spent = float(row.get('total_spent', 0))
-            purchases = int(row.get('total_purchases', 0))
-            cust = session.query(Customer).filter_by(phone=phone).first()
-            if cust:
-                cust.total_spent = spent
-                cust.total_purchases = purchases
-            else:
-                cust = Customer(name=name, phone=phone, total_spent=spent, total_purchases=purchases)
-                session.add(cust)
-        session.commit()
-    # Cập nhật lại type cho tất cả khách (có thể làm riêng để tránh session conflict)
-    with SessionLocal() as session:
-        for cust in session.query(Customer).all():
-            update_customer_type(cust.id)
+    with SessionLocal() as s:
+        for _,r in df.iterrows():
+            name, phone = r['name'], str(r['phone'])
+            spent = float(r.get('total_spent',0))
+            purchases = int(r.get('total_purchases',0))
+            cust = s.query(Customer).filter_by(phone=phone).first()
+            if cust: cust.total_spent, cust.total_purchases = spent, purchases
+            else: s.add(Customer(name=name, phone=phone, total_spent=spent, total_purchases=purchases))
+        s.commit()
+    for c in get_customers(): update_customer_type(c['id'])
+    clear_cache()
 
-def generate_pdf_invoice(sale_id, customer_name, customer_phone, customer_type, items, total, discount, final):
-    # Font hỗ trợ tiếng Việt
-    font_path = "fonts/DejaVuSans.ttf"
-    if not os.path.exists(font_path):
-        # Fallback dùng font chuẩn nhưng sẽ lỗi tiếng Việt
-        st.warning("Không tìm thấy font DejaVuSans.ttf trong thư mục fonts/. Hóa đơn có thể không hiển thị tiếng Việt.")
-        pdf = FPDF()
-        pdf.set_auto_page_break(auto=True, margin=15)
-        pdf.add_page()
-        pdf.set_font("Arial", size=12)
-    else:
-        pdf = FPDF()
-        pdf.add_font('DejaVu', '', font_path, uni=True)
-        pdf.set_auto_page_break(auto=True, margin=15)
-        pdf.add_page()
-        pdf.set_font('DejaVu', '', 12)
-    
-    pdf.cell(200, 10, txt="HÓA ĐƠN BÁN HÀNG", ln=1, align='C')
-    pdf.cell(200, 10, txt=f"Mã HD: {sale_id}", ln=1)
-    pdf.cell(200, 10, txt=f"Khách hàng: {customer_name} - {customer_phone} ({customer_type})", ln=1)
-    pdf.cell(200, 10, txt=f"Ngày: {datetime.now().strftime('%d/%m/%Y %H:%M')}", ln=1)
+def gen_pdf(sale_id, cus_name, cus_phone, cus_type, items, total, discount, final):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+    pdf.cell(200,10,"HÓA ĐƠN BÁN HÀNG",ln=1,align='C')
+    pdf.cell(200,10,f"Mã HD: {sale_id}",ln=1)
+    pdf.cell(200,10,f"Khách hàng: {cus_name} - {cus_phone} ({cus_type})",ln=1)
+    pdf.cell(200,10,f"Ngày: {datetime.now().strftime('%d/%m/%Y %H:%M')}",ln=1)
     pdf.ln(10)
-    
-    pdf.set_font('DejaVu', 'B', 10) if os.path.exists(font_path) else pdf.set_font("Arial", 'B', 10)
-    pdf.cell(80, 10, "Sản phẩm", 1)
-    pdf.cell(30, 10, "SL", 1)
-    pdf.cell(40, 10, "Đơn giá", 1)
-    pdf.cell(40, 10, "Thành tiền", 1)
-    pdf.ln()
-    
-    pdf.set_font('DejaVu', '', 10) if os.path.exists(font_path) else pdf.set_font("Arial", size=10)
-    for item in items:
-        pdf.cell(80, 10, item['name'], 1)
-        pdf.cell(30, 10, str(item['qty']), 1)
-        pdf.cell(40, 10, f"{item['price']:,.0f}", 1)
-        pdf.cell(40, 10, f"{item['qty']*item['price']:,.0f}", 1)
+    pdf.set_font("Arial",'B',10)
+    pdf.cell(80,10,"Sản phẩm",1); pdf.cell(30,10,"SL",1); pdf.cell(40,10,"Đơn giá",1); pdf.cell(40,10,"Thành tiền",1); pdf.ln()
+    pdf.set_font("Arial",size=10)
+    for it in items:
+        pdf.cell(80,10,it['name'],1)
+        pdf.cell(30,10,str(it['qty']),1)
+        pdf.cell(40,10,f"{int(it['price'])}",1)
+        pdf.cell(40,10,f"{int(it['qty']*it['price'])}",1)
         pdf.ln()
-    
     pdf.ln(5)
-    pdf.cell(200, 10, txt=f"Tổng tiền: {total:,.0f} VNĐ", ln=1)
-    pdf.cell(200, 10, txt=f"Giảm giá: {discount:,.0f} VNĐ", ln=1)
-    pdf.set_font('DejaVu', 'B', 12) if os.path.exists(font_path) else pdf.set_font("Arial", 'B', 12)
-    pdf.cell(200, 10, txt=f"Thực thu: {final:,.0f} VNĐ", ln=1)
-    
-    pdf_output = io.BytesIO()
-    pdf_output.write(pdf.output(dest='S').encode('latin1'))
-    pdf_output.seek(0)
-    return pdf_output
+    pdf.cell(200,10,f"Tổng tiền: {int(total)} VNĐ",ln=1)
+    pdf.cell(200,10,f"Giảm giá: {int(discount)} VNĐ",ln=1)
+    pdf.set_font("Arial",'B',12)
+    pdf.cell(200,10,f"Thực thu: {int(final)} VNĐ",ln=1)
+    buf = io.BytesIO()
+    buf.write(pdf.output(dest='S').encode('latin1'))
+    buf.seek(0)
+    return buf
 
-# ---------- GIAO DIỆN STREAMLIT ----------
+# ---------- LOGIN ----------
+def login(username, password):
+    with SessionLocal() as s:
+        u = s.query(User).filter_by(username=username).first()
+        if u and verify_password(password, u.password_hash): return u.role
+    return None
+
+def get_or_create_guest():
+    with SessionLocal() as s:
+        guest = s.query(Customer).filter_by(phone="0000000000").first()
+        if not guest:
+            guest = Customer(name="Khách lẻ", phone="0000000000")
+            s.add(guest)
+            s.commit()
+        return guest.id
+
+# ---------- STREAMLIT APP ----------
 st.set_page_config(page_title="Hệ thống bán hàng Pro", layout="wide")
+if 'logged_in' not in st.session_state: st.session_state.logged_in = False
+if 'role' not in st.session_state: st.session_state.role = None
+if 'cart' not in st.session_state: st.session_state.cart = []
+if 'sale_step' not in st.session_state: st.session_state.sale_step = 1
+if 'search' not in st.session_state: st.session_state.search = ""
+if 'current_customer' not in st.session_state: st.session_state.current_customer = get_or_create_guest()
+if 'barcode_scanner' not in st.session_state: st.session_state.barcode_scanner = ""
 
-if 'logged_in' not in st.session_state:
-    st.session_state.logged_in = False
-if 'role' not in st.session_state:
-    st.session_state.role = None
-if 'cart' not in st.session_state:
-    st.session_state.cart = []
-if 'sale_step' not in st.session_state:
-    st.session_state.sale_step = 1
-if 'search_term' not in st.session_state:
-    st.session_state.search_term = ""
-
-# Đăng nhập
 if not st.session_state.logged_in:
     st.title("🔐 Đăng nhập")
     with st.form("login"):
-        username = st.text_input("Tên đăng nhập")
-        password = st.text_input("Mật khẩu", type="password")
+        uname = st.text_input("Tên đăng nhập")
+        pwd = st.text_input("Mật khẩu", type="password")
         if st.form_submit_button("Đăng nhập"):
-            role = login(username, password)
+            role = login(uname, pwd)
             if role:
                 st.session_state.logged_in = True
                 st.session_state.role = role
                 st.rerun()
-            else:
-                st.error("Sai tên hoặc mật khẩu")
+            else: st.error("Sai tên hoặc mật khẩu")
     st.stop()
 
-# Sidebar menu
-menu = st.sidebar.radio("Chức năng", 
-    ["🏠 Trang chủ", "📦 Sản phẩm", "🛒 Bán hàng", "👥 Khách hàng", "🔥 Khách thân thiết", "📊 Dashboard", "⚙️ Cài đặt (Admin)"])
+menu = st.sidebar.radio("Chức năng", ["🏠 Trang chủ", "📦 Sản phẩm", "🛒 Bán hàng", "👥 Khách hàng", "🔥 Khách thân thiết", "📊 Dashboard", "⚙️ Cài đặt (Admin)"])
 
-# ---------- ADMIN ----------
+# -------------------- ADMIN --------------------
 if st.session_state.role == 'admin':
     if menu == "⚙️ Cài đặt (Admin)":
-        st.header("Cài đặt hệ thống")
-        with SessionLocal() as session:
-            with st.form("settings"):
-                loyal_spent = st.number_input("Ngưỡng chi tiêu (VNĐ) - Khách Thân thiết", value=float(session.query(Setting).filter_by(key='loyal_min_spent').first().value))
-                loyal_pur = st.number_input("Ngưỡng số lần mua - Khách Thân thiết", value=int(session.query(Setting).filter_by(key='loyal_min_purchases').first().value))
-                longtime_spent = st.number_input("Ngưỡng chi tiêu (VNĐ) - Khách Lâu năm", value=float(session.query(Setting).filter_by(key='longtime_min_spent').first().value))
-                longtime_pur = st.number_input("Ngưỡng số lần mua - Khách Lâu năm", value=int(session.query(Setting).filter_by(key='longtime_min_purchases').first().value))
-                loyal_disc = st.number_input("Giảm giá (%) - Thân thiết", value=float(session.query(Setting).filter_by(key='loyal_discount').first().value))
-                longtime_disc = st.number_input("Giảm giá (%) - Lâu năm", value=float(session.query(Setting).filter_by(key='longtime_discount').first().value))
-                regular_disc = st.number_input("Giảm giá (%) - Thường", value=float(session.query(Setting).filter_by(key='regular_discount').first().value))
-                if st.form_submit_button("Lưu"):
-                    for k, v in [('loyal_min_spent', loyal_spent), ('loyal_min_purchases', loyal_pur),
-                                 ('longtime_min_spent', longtime_spent), ('longtime_min_purchases', longtime_pur),
-                                 ('loyal_discount', loyal_disc), ('longtime_discount', longtime_disc),
-                                 ('regular_discount', regular_disc)]:
-                        setting = session.query(Setting).filter_by(key=k).first()
-                        setting.value = str(v)
-                    session.commit()
-                    st.success("Đã lưu. Phân loại khách hàng sẽ cập nhật sau.")
-                    # Cập nhật lại type
-                    for cust in session.query(Customer).all():
-                        update_customer_type(cust.id)
-                    st.rerun()
-        
-        st.subheader("Tải lên danh sách khách hàng (CSV)")
-        uploaded = st.file_uploader("File CSV (cột: name, phone, total_spent, total_purchases)", type="csv")
-        if uploaded:
-            upload_customers_csv(uploaded)
-            st.success("Đã cập nhật")
-    
-    if menu == "📦 Sản phẩm":
-        st.header("Quản lý sản phẩm")
-        tab1, tab2 = st.tabs(["Thêm mới", "Sửa/Xóa"])
-        with tab1:
-            with st.form("add_prod"):
-                name = st.text_input("Tên sản phẩm")
-                price = st.number_input("Giá", min_value=0.0, step=1000.0)
-                stock = st.number_input("Số lượng", min_value=0, step=1)
-                barcode = st.text_input("Mã vạch/QR (tùy chọn)")
-                image = st.file_uploader("Hình ảnh", type=['png','jpg','jpeg'])
-                if st.form_submit_button("Thêm"):
-                    if name and price > 0:
-                        add_product(name, price, stock, image, barcode)
-                        st.success("Đã thêm")
-                        st.rerun()
-        with tab2:
-            products = get_all_products()
-            if products:
-                prod_dict = {f"{p.id} - {p.name}": p for p in products}
-                selected = st.selectbox("Chọn sản phẩm", list(prod_dict.keys()))
-                p = prod_dict[selected]
-                with st.form("edit_prod"):
-                    new_name = st.text_input("Tên", p.name)
-                    new_price = st.number_input("Giá", value=p.price, step=1000.0)
-                    new_stock = st.number_input("Tồn kho", value=p.stock, step=1)
-                    new_barcode = st.text_input("Mã vạch", value=p.barcode or "")
-                    new_image = st.file_uploader("Thay ảnh mới", type=['png','jpg','jpeg'])
-                    if st.form_submit_button("Cập nhật"):
-                        update_product(p.id, new_name, new_price, new_stock, new_image, new_barcode)
-                        st.success("Đã cập nhật")
-                        st.rerun()
-                if st.button("Xóa", key="del"):
-                    delete_product(p.id)
-                    st.rerun()
-            else:
-                st.info("Chưa có sản phẩm")
-    
-    if menu == "📊 Dashboard":
-        st.header("Thống kê & Báo cáo")
-        with SessionLocal() as session:
-            sales = session.query(Sale).all()
-            if sales:
-                df_sales = pd.DataFrame([(s.date.date(), s.final_amount) for s in sales], columns=['Ngày', 'Doanh thu'])
-                df_sales = df_sales.groupby('Ngày').sum().reset_index()
-                fig = px.line(df_sales, x='Ngày', y='Doanh thu', title='Doanh thu theo ngày')
-                st.plotly_chart(fig, use_container_width=True)
-                
-                items = session.query(SaleItem.product_id, func.sum(SaleItem.quantity).label('total_qty')).group_by(SaleItem.product_id).all()
-                if items:
-                    prod_ids = [i[0] for i in items]
-                    qties = [i[1] for i in items]
-                    names = [session.query(Product).get(pid).name for pid in prod_ids]
-                    df_top = pd.DataFrame({'Sản phẩm': names, 'Số lượng bán': qties}).sort_values('Số lượng bán', ascending=False).head(10)
-                    fig2 = px.bar(df_top, x='Sản phẩm', y='Số lượng bán', title='Top 10 sản phẩm bán chạy')
-                    st.plotly_chart(fig2, use_container_width=True)
-            else:
-                st.info("Chưa có dữ liệu bán hàng")
-    
-    if menu == "🔥 Khách thân thiết":
-        st.header("🔥 Danh sách khách hàng thân thiết")
-        loyals = get_loyal_customers()
-        if loyals:
-            df = pd.DataFrame([(c.name, c.phone, c.total_spent, c.total_purchases) for c in loyals],
-                              columns=["Tên", "SĐT", "Chi tiêu (VNĐ)", "Số lần mua"])
-            st.dataframe(df)
-        else:
-            st.info("Chưa có khách hàng thân thiết nào.")
-        
-        st.subheader("🏆 Top 10 khách hàng VIP (chi tiêu cao nhất)")
-        vips = get_top_vip_customers(10)
-        if vips:
-            df_vip = pd.DataFrame([(c.name, c.phone, c.total_spent, c.total_purchases, c.type) for c in vips],
-                                   columns=["Tên", "SĐT", "Chi tiêu (VNĐ)", "Số lần mua", "Loại"])
-            st.dataframe(df_vip)
-        else:
-            st.info("Chưa có dữ liệu khách hàng.")
+        st.header("Cài đặt")
+        sets = get_settings()
+        with st.form("settings"):
+            loyal_spent = st.number_input("Ngưỡng chi tiêu - Thân thiết", value=float(sets.get('loyal_min_spent',5000000)), step=100000, format="%d")
+            loyal_pur = st.number_input("Số lần mua - Thân thiết", value=int(sets.get('loyal_min_purchases',10)), step=1)
+            longtime_spent = st.number_input("Ngưỡng chi tiêu - Lâu năm", value=float(sets.get('longtime_min_spent',2000000)), step=100000, format="%d")
+            longtime_pur = st.number_input("Số lần mua - Lâu năm", value=int(sets.get('longtime_min_purchases',5)), step=1)
+            loyal_disc = st.number_input("Giảm giá (%) - Thân thiết", value=float(sets.get('loyal_discount',5)), step=0.5)
+            longtime_disc = st.number_input("Giảm giá (%) - Lâu năm", value=float(sets.get('longtime_discount',2)), step=0.5)
+            regular_disc = st.number_input("Giảm giá (%) - Thường", value=float(sets.get('regular_discount',0)), step=0.5)
+            if st.form_submit_button("Lưu"):
+                with SessionLocal() as s:
+                    for k,v in [('loyal_min_spent',loyal_spent),('loyal_min_purchases',loyal_pur),('longtime_min_spent',longtime_spent),
+                                ('longtime_min_purchases',longtime_pur),('loyal_discount',loyal_disc),('longtime_discount',longtime_disc),
+                                ('regular_discount',regular_disc)]:
+                        s.query(Setting).filter_by(key=k).first().value = str(v)
+                    s.commit()
+                clear_cache()
+                st.success("Đã lưu"); st.rerun()
+        st.subheader("Tải CSV khách hàng")
+        up = st.file_uploader("File CSV (name, phone, total_spent, total_purchases)", type="csv")
+        if up: upload_csv(up); st.success("Đã cập nhật")
 
-# ---------- NHÂN VIÊN ----------
+    elif menu == "📦 Sản phẩm":
+        st.header("Quản lý sản phẩm")
+        tab1, tab2 = st.tabs(["Thêm", "Sửa/Xóa"])
+        with tab1:
+            with st.form("add"):
+                name = st.text_input("Tên")
+                price = st.number_input("Giá", min_value=0.0, step=1000.0, format="%d")
+                stock = st.number_input("Số lượng", min_value=0, step=1)
+                barcode = st.text_input("Mã vạch")
+                img = st.file_uploader("Ảnh", type=['png','jpg','jpeg'])
+                if st.form_submit_button("Thêm"):
+                    if name and price>0: add_product(name, price, stock, img, barcode); st.success("Đã thêm"); st.rerun()
+        with tab2:
+            prods = get_products()
+            if prods:
+                sel = st.selectbox("Chọn", [f"{p['id']} - {p['name']}" for p in prods])
+                p = next(x for x in prods if f"{x['id']} - {x['name']}" == sel)
+                with st.form("edit"):
+                    nname = st.text_input("Tên", p['name'])
+                    nprice = st.number_input("Giá", value=p['price'], step=1000.0, format="%d")
+                    nstock = st.number_input("Tồn kho", value=p['stock'], step=1)
+                    nbarcode = st.text_input("Mã vạch", value=p.get('barcode',''))
+                    nimg = st.file_uploader("Ảnh mới", type=['png','jpg','jpeg'])
+                    if st.form_submit_button("Cập nhật"):
+                        update_product(p['id'], nname, nprice, nstock, nimg, nbarcode); st.success("Đã cập nhật"); st.rerun()
+                if st.button("Xóa"): delete_product(p['id']); st.rerun()
+            else: st.info("Chưa có sản phẩm")
+
+    elif menu == "👥 Khách hàng":
+        st.header("Danh sách khách hàng")
+        df = pd.DataFrame(get_customers())
+        if not df.empty: df['total_spent'] = df['total_spent'].apply(lambda x: f"{int(x):,}"); st.dataframe(df)
+        else: st.info("Chưa có")
+
+    elif menu == "🔥 Khách thân thiết":
+        st.header("Khách thân thiết")
+        df = pd.DataFrame(get_loyal())
+        if not df.empty: df['total_spent'] = df['total_spent'].apply(lambda x: f"{int(x):,}"); st.dataframe(df)
+        else: st.info("Chưa có")
+        st.subheader("Top 10 VIP")
+        dfv = pd.DataFrame(get_vip())
+        if not dfv.empty: dfv['total_spent'] = dfv['total_spent'].apply(lambda x: f"{int(x):,}"); st.dataframe(dfv)
+
+    elif menu == "📊 Dashboard":
+        st.header("Thống kê")
+        sales = get_sales()
+        if sales:
+            total = sum(s['final_amount'] for s in sales)
+            c1,c2,c3 = st.columns(3)
+            c1.metric("Doanh thu", f"{int(total):,} VNĐ")
+            c2.metric("Số đơn", len(sales))
+            c3.metric("Khách hàng", len(get_customers()))
+            df = pd.DataFrame(sales)
+            df['date'] = pd.to_datetime(df['date']).dt.date
+            df = df.groupby('date')['final_amount'].sum().reset_index()
+            st.plotly_chart(px.line(df, x='date', y='final_amount', title='Doanh thu theo ngày'), use_container_width=True)
+            top = get_top_products()
+            if top: st.plotly_chart(px.bar(pd.DataFrame(top), x='name', y='total_qty', title='Top sản phẩm'), use_container_width=True)
+        else: st.info("Chưa có dữ liệu")
+
+    elif menu == "🏠 Trang chủ": st.header("Tổng quan Admin")
+
+# -------------------- NHÂN VIÊN --------------------
 else:
-    if menu == "🏠 Trang chủ":
-        st.header("Chào mừng nhân viên")
-        st.info("Sử dụng thanh menu để bán hàng, xem kho, quản lý khách hàng.")
-    
-    if menu == "📦 Sản phẩm":
-        st.header("Thêm sản phẩm mới")
+    if menu == "🏠 Trang chủ": st.header("Chào mừng nhân viên")
+    elif menu == "📦 Sản phẩm":
+        st.header("Thêm sản phẩm")
         with st.form("staff_add"):
-            name = st.text_input("Tên sản phẩm")
-            price = st.number_input("Giá bán", min_value=0.0, step=1000.0)
-            stock = st.number_input("Số lượng nhập", min_value=0, step=1)
-            barcode = st.text_input("Mã vạch (tùy chọn)")
-            image = st.file_uploader("Hình ảnh", type=['png','jpg','jpeg'])
+            name = st.text_input("Tên")
+            price = st.number_input("Giá", min_value=0.0, step=1000.0, format="%d")
+            stock = st.number_input("Số lượng", min_value=0, step=1)
+            barcode = st.text_input("Mã vạch")
+            img = st.file_uploader("Ảnh", type=['png','jpg','jpeg'])
             if st.form_submit_button("Thêm"):
-                if name and price > 0:
-                    add_product(name, price, stock, image, barcode)
-                    st.success("Đã thêm sản phẩm mới")
-                    st.rerun()
-        st.subheader("Danh sách sản phẩm hiện có")
-        products = get_all_products()
-        if products:
-            for p in products:
-                col1, col2 = st.columns([1, 3])
-                with col1:
-                    if p.image_url:
-                        st.image(p.image_url, width=100)
-                with col2:
-                    st.write(f"**{p.name}** - {p.price:,.0f}đ - Tồn: {p.stock}")
-        else:
-            st.info("Chưa có sản phẩm")
-    
-    if menu == "🛒 Bán hàng":
-        st.header("Tạo đơn hàng")
-        if st.session_state.sale_step == 1:
-            customers = get_customers()
-            if not customers:
-                st.warning("Chưa có khách hàng. Vui lòng thêm mới.")
-                with st.form("new_cust"):
-                    name = st.text_input("Tên")
-                    phone = st.text_input("SĐT")
-                    if st.form_submit_button("Tạo"):
-                        add_customer(name, phone)
+                if name and price>0: add_product(name, price, stock, img, barcode); st.success("Đã thêm"); st.rerun()
+        st.subheader("Danh sách sản phẩm")
+        prods = get_products()
+        if prods:
+            cols = st.columns(4)
+            for i,p in enumerate(prods):
+                with cols[i%4]:
+                    if p['image_url']: st.image(p['image_url'], use_container_width=True)
+                    st.markdown(f"<div class='product-card'><h4>{p['name']}</h4><p class='price'>{int(p['price']):,}đ</p><p class='stock'>📦 Tồn: {p['stock']}</p></div>", unsafe_allow_html=True)
+        else: st.info("Chưa có sản phẩm")
+
+    elif menu == "🛒 Bán hàng":
+        st.header("Bán hàng - Quét mã vạch / Chọn sản phẩm")
+
+        # Ô quét mã vạch
+        barcode_scanned = st.text_input("📷 Quét mã vạch (hoặc nhập)", key="barcode_scanner", placeholder="Đưa mã vạch vào đây...")
+        if barcode_scanned:
+            with SessionLocal() as s:
+                prod = s.query(Product).filter_by(barcode=barcode_scanned).first()
+                if prod:
+                    found = False
+                    for item in st.session_state.cart:
+                        if item['id'] == prod.id:
+                            item['qty'] += 1
+                            found = True
+                            break
+                    if not found:
+                        st.session_state.cart.append({
+                            'id': prod.id,
+                            'name': prod.name,
+                            'price': prod.price,
+                            'qty': 1
+                        })
+                    st.success(f"Đã thêm {prod.name}")
+                else:
+                    st.warning("Không tìm thấy sản phẩm")
+            st.session_state.barcode_scanner = ""
+            st.rerun()
+
+        # Giỏ hàng
+        st.subheader("🛒 Giỏ hàng")
+        if st.session_state.cart:
+            total = 0
+            for idx, it in enumerate(st.session_state.cart):
+                col1, col2, col3, col4, col5 = st.columns([3,1,1,1,1])
+                col1.write(f"**{it['name']}** - {int(it['price']):,}đ")
+                col2.write(f"SL: {it['qty']}")
+                if col3.button("➕", key=f"inc_{idx}"):
+                    prod = next((p for p in get_products() if p['id'] == it['id']), None)
+                    if prod and it['qty'] < prod['stock']:
+                        it['qty'] += 1
                         st.rerun()
-            else:
-                cust_options = {f"{c.name} - {c.phone} ({c.type})": c.id for c in customers}
-                selected = st.selectbox("Chọn khách hàng", list(cust_options.keys()))
-                if st.button("Chọn"):
-                    st.session_state.current_customer = cust_options[selected]
-                    st.session_state.sale_step = 2
-                    st.rerun()
-                with st.expander("Hoặc thêm khách mới"):
-                    new_name = st.text_input("Tên mới")
-                    new_phone = st.text_input("SĐT mới")
-                    if st.button("Thêm và chọn"):
-                        add_customer(new_name, new_phone)
-                        with SessionLocal() as session:
-                            cust = session.query(Customer).filter_by(phone=new_phone).first()
-                            st.session_state.current_customer = cust.id
-                        st.session_state.sale_step = 2
+                    else:
+                        st.warning("Không đủ hàng")
+                if col4.button("➖", key=f"dec_{idx}"):
+                    if it['qty'] > 1:
+                        it['qty'] -= 1
                         st.rerun()
-        else:
-            # Giỏ hàng
-            st.subheader("🛒 Giỏ hàng")
-            if st.session_state.cart:
-                for idx, item in enumerate(st.session_state.cart):
-                    col1, col2, col3, col4, col5 = st.columns([3,1,1,1,1])
-                    col1.write(f"{item['name']} - {item['price']:,.0f}đ")
-                    col2.write(f"Số lượng: {item['qty']}")
-                    if col3.button("➕", key=f"inc_{idx}"):
-                        with SessionLocal() as session:
-                            prod = session.query(Product).get(item['id'])
-                            if prod.stock > item['qty']:
-                                st.session_state.cart[idx]['qty'] += 1
-                            else:
-                                st.warning("Không đủ hàng")
-                        st.rerun()
-                    if col4.button("➖", key=f"dec_{idx}"):
-                        if item['qty'] > 1:
-                            st.session_state.cart[idx]['qty'] -= 1
-                        else:
-                            st.session_state.cart.pop(idx)
-                        st.rerun()
-                    if col5.button("❌", key=f"del_{idx}"):
+                    else:
                         st.session_state.cart.pop(idx)
                         st.rerun()
-                
-                total = sum(item['price'] * item['qty'] for item in st.session_state.cart)
-                discount = get_discount_for_customer(st.session_state.current_customer)
-                discount_amt = total * discount / 100
-                final = total - discount_amt
-                st.metric("Tổng tiền", f"{total:,.0f} VNĐ")
-                st.write(f"Giảm giá {discount}% : -{discount_amt:,.0f} VNĐ")
-                st.metric("Thực thu", f"{final:,.0f} VNĐ")
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("Thanh toán"):
-                        cart_items = [(item['id'], item['qty'], item['price']) for item in st.session_state.cart]
-                        try:
-                            sale_id, final_amt, disc_amt = record_sale(st.session_state.current_customer, cart_items, discount)
-                            st.success(f"Thanh toán thành công! Hóa đơn #{sale_id}")
-                            with SessionLocal() as session:
-                                cust = session.query(Customer).get(st.session_state.current_customer)
-                                pdf_buffer = generate_pdf_invoice(sale_id, cust.name, cust.phone, cust.type,
-                                                                  st.session_state.cart, total, disc_amt, final_amt)
-                            st.download_button("📄 Tải hóa đơn PDF", data=pdf_buffer, file_name=f"invoice_{sale_id}.pdf", mime="application/pdf")
-                            st.session_state.cart = []
-                            st.session_state.sale_step = 1
-                            st.session_state.current_customer = None
-                            st.rerun()
-                        except ValueError as e:
-                            st.error(str(e))
-                with col2:
-                    if st.button("Hủy đơn"):
+                if col5.button("❌", key=f"del_{idx}"):
+                    st.session_state.cart.pop(idx)
+                    st.rerun()
+                total += it['price'] * it['qty']
+
+            disc_percent = get_discount(st.session_state.current_customer)
+            disc_amt = total * disc_percent / 100
+            final = total - disc_amt
+
+            colA, colB, colC = st.columns(3)
+            colA.metric("Tổng tiền", f"{int(total):,} VNĐ")
+            colB.metric(f"Giảm giá ({disc_percent}%)", f"-{int(disc_amt):,} VNĐ")
+            colC.metric("Thực thu", f"{int(final):,} VNĐ")
+
+            colX, colY = st.columns(2)
+            with colX:
+                if st.button("✅ Thanh toán", use_container_width=True):
+                    cart_items = [(it['id'], it['qty'], it['price']) for it in st.session_state.cart]
+                    try:
+                        sale_id, f_amt, d_amt = record_sale(st.session_state.current_customer, cart_items, disc_percent)
+                        st.success(f"Thanh toán thành công! Hóa đơn #{sale_id}")
+                        cus = next((c for c in get_customers() if c['id'] == st.session_state.current_customer), None)
+                        if cus:
+                            pdf = gen_pdf(sale_id, cus['name'], cus['phone'], cus['type'], st.session_state.cart, total, d_amt, f_amt)
+                            st.download_button("📄 Tải hóa đơn PDF", pdf, f"invoice_{sale_id}.pdf", "application/pdf")
                         st.session_state.cart = []
-                        st.session_state.sale_step = 1
                         st.rerun()
-            else:
-                st.info("Giỏ hàng trống")
-            
-            # Thêm sản phẩm vào giỏ
-            st.subheader("Thêm sản phẩm")
-            search = st.text_input("🔍 Tìm kiếm (tên hoặc mã vạch)", value=st.session_state.search_term)
-            if search != st.session_state.search_term:
-                st.session_state.search_term = search
-                st.rerun()
-            products = get_all_products(st.session_state.search_term)
-            if products:
-                for p in products:
-                    col1, col2, col3, col4 = st.columns([1,3,1,1])
-                    with col1:
-                        if p.image_url:
-                            st.image(p.image_url, width=80)
-                    with col2:
-                        st.write(f"**{p.name}** - {p.price:,.0f}đ (còn {p.stock})")
-                    with col3:
-                        qty = st.number_input("SL", min_value=1, max_value=p.stock, value=1, key=f"qty_{p.id}")
-                    with col4:
-                        if st.button("➕ Thêm", key=f"add_{p.id}"):
-                            found = False
-                            for item in st.session_state.cart:
-                                if item['id'] == p.id:
-                                    new_qty = item['qty'] + qty
-                                    if new_qty <= p.stock:
-                                        item['qty'] = new_qty
-                                    else:
-                                        st.warning("Vượt quá tồn kho")
-                                    found = True
-                                    break
-                            if not found:
-                                st.session_state.cart.append({'id': p.id, 'name': p.name, 'price': p.price, 'qty': qty})
-                            st.rerun()
-            else:
-                st.info("Không tìm thấy sản phẩm")
-    
-    if menu == "👥 Khách hàng":
+                    except Exception as e:
+                        st.error(str(e))
+            with colY:
+                if st.button("🗑 Hủy đơn", use_container_width=True):
+                    st.session_state.cart = []
+                    st.rerun()
+        else:
+            st.info("Giỏ hàng trống")
+
+        # Danh sách sản phẩm
+        st.markdown("---")
+        st.subheader("📦 Chọn sản phẩm từ danh sách")
+        search = st.text_input("🔍 Tìm kiếm theo tên hoặc mã vạch", value=st.session_state.search, key="search_box")
+        if search != st.session_state.search:
+            st.session_state.search = search
+            st.rerun()
+
+        products = get_products(st.session_state.search)
+        if products:
+            cols = st.columns(4)
+            for i, p in enumerate(products):
+                with cols[i % 4]:
+                    if p['image_url']:
+                        st.image(p['image_url'], use_container_width=True)
+                    st.markdown(f"<div class='product-card'><h4>{p['name']}</h4><p class='price'>{int(p['price']):,}đ</p><p class='stock'>📦 Tồn: {p['stock']}</p></div>", unsafe_allow_html=True)
+                    qty = st.number_input("SL", min_value=1, max_value=p['stock'], value=1, key=f"qty_{p['id']}", label_visibility="collapsed")
+                    if st.button(f"➕ Thêm {p['name']}", key=f"add_{p['id']}"):
+                        found = False
+                        for item in st.session_state.cart:
+                            if item['id'] == p['id']:
+                                new_qty = item['qty'] + qty
+                                if new_qty <= p['stock']:
+                                    item['qty'] = new_qty
+                                else:
+                                    st.warning("Vượt quá tồn kho")
+                                found = True
+                                break
+                        if not found:
+                            st.session_state.cart.append({
+                                'id': p['id'],
+                                'name': p['name'],
+                                'price': p['price'],
+                                'qty': qty
+                            })
+                        st.rerun()
+        else:
+            st.info("Không tìm thấy sản phẩm")
+
+    elif menu == "👥 Khách hàng":
         st.header("Danh sách khách hàng")
-        customers = get_customers()
-        if customers:
-            df = pd.DataFrame([(c.id, c.name, c.phone, c.total_spent, c.total_purchases, c.type) for c in customers],
-                              columns=['ID', 'Tên', 'SĐT', 'Chi tiêu', 'Số lần mua', 'Loại'])
-            st.dataframe(df)
-        else:
-            st.info("Chưa có khách hàng")
-    
-    if menu == "🔥 Khách thân thiết":
-        st.header("🔥 Danh sách khách hàng thân thiết")
-        loyals = get_loyal_customers()
-        if loyals:
-            df = pd.DataFrame([(c.name, c.phone, c.total_spent, c.total_purchases) for c in loyals],
-                              columns=["Tên", "SĐT", "Chi tiêu (VNĐ)", "Số lần mua"])
-            st.dataframe(df)
-        else:
-            st.info("Chưa có khách hàng thân thiết nào.")
-        
-        st.subheader("🏆 Top 10 khách hàng VIP")
-        vips = get_top_vip_customers(10)
-        if vips:
-            df_vip = pd.DataFrame([(c.name, c.phone, c.total_spent, c.total_purchases, c.type) for c in vips],
-                                   columns=["Tên", "SĐT", "Chi tiêu (VNĐ)", "Số lần mua", "Loại"])
-            st.dataframe(df_vip)
-        else:
-            st.info("Chưa có dữ liệu khách hàng.")
-    
-    if menu == "📊 Dashboard":
-        st.header("Xem báo cáo (Nhân viên chỉ xem được lịch sử bán hàng)")
-        with SessionLocal() as session:
-            sales = session.query(Sale).all()
-            if sales:
-                df = pd.DataFrame([(s.id, s.date, s.final_amount) for s in sales], columns=['Mã HD', 'Ngày', 'Thành tiền'])
-                st.dataframe(df)
-            else:
-                st.info("Chưa có hóa đơn nào.")
+        df = pd.DataFrame(get_customers())
+        if not df.empty: df['total_spent'] = df['total_spent'].apply(lambda x: f"{int(x):,}"); st.dataframe(df)
+        else: st.info("Chưa có")
+
+    elif menu == "🔥 Khách thân thiết":
+        st.header("Khách thân thiết")
+        df = pd.DataFrame(get_loyal())
+        if not df.empty: df['total_spent'] = df['total_spent'].apply(lambda x: f"{int(x):,}"); st.dataframe(df)
+        else: st.info("Chưa có")
+        st.subheader("Top 10 VIP")
+        dfv = pd.DataFrame(get_vip())
+        if not dfv.empty: dfv['total_spent'] = dfv['total_spent'].apply(lambda x: f"{int(x):,}"); st.dataframe(dfv)
+
+    elif menu == "📊 Báo cáo":
+        st.header("Lịch sử bán hàng")
+        df = pd.DataFrame(get_sales())
+        if not df.empty: df['final_amount'] = df['final_amount'].apply(lambda x: f"{int(x):,}"); st.dataframe(df)
+        else: st.info("Chưa có hóa đơn")
 
 # Đăng xuất
 if st.sidebar.button("Đăng xuất"):
-    for key in list(st.session_state.keys()):
-        del st.session_state[key]
+    for k in list(st.session_state.keys()): del st.session_state[k]
     st.rerun()
