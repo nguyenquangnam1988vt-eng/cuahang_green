@@ -21,9 +21,9 @@ DATABASE_URL = "sqlite:///sales.db"  # Ví dụ: "postgresql://user:pass@localho
 # Nếu dùng PostgreSQL, cài psycopg2-binary và sửa URL
 
 # Cloudinary (đăng ký miễn phí tại cloudinary.com)
-CLOUD_NAME = "your_cloud_name"   # Thay bằng của bạn
-API_KEY = "your_api_key"
-API_SECRET = "your_api_secret"
+CLOUD_NAME = os.getenv("CLOUD_NAME")
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
 
 cloudinary.config(
     cloud_name=CLOUD_NAME,
