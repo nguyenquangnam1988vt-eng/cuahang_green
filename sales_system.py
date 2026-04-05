@@ -2,36 +2,44 @@ import streamlit as st
 import pandas as pd
 import os
 import bcrypt
-from datetime import datetime
+from datetime import datetime, timedelta
 from sqlalchemy import create_engine, Column, String, Integer, Float, DateTime, ForeignKey, or_, func
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from sqlalchemy.pool import NullPool
 import cloudinary
 import cloudinary.uploader
 import plotly.express as px
-from fpdf import FPDF
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 import io
 import tempfile
 
-# ---------- CẤU HÌNH DATABASE (TỰ ĐỘNG PHÁT HIỆN CLOUD) ----------
-# Nếu đang chạy trên Streamlit Cloud hoặc không có file sales.db ở thư mục hiện tại -> dùng /tmp
-if os.environ.get('STREAMLIT_CLOUD') or os.environ.get('STREAMLIT_RUNTIME') or not os.path.exists('sales.db'):
-    DB_PATH = os.path.join(tempfile.gettempdir(), 'sales.db')
+# ---------- CẤU HÌNH DATABASE (CHUẨN PRODUCTION) ----------
+# Ưu tiên PostgreSQL từ secrets, nếu không thì SQLite local
+if os.environ.get('STREAMLIT_CLOUD') or os.environ.get('STREAMLIT_RUNTIME'):
+    try:
+        DATABASE_URL = st.secrets["DATABASE_URL"]   # PostgreSQL URL
+        use_postgres = True
+    except:
+        # Fallback SQLite (dùng file trong thư mục hiện tại, không /tmp)
+        DATABASE_URL = "sqlite:///sales.db"
+        use_postgres = False
 else:
-    DB_PATH = 'sales.db'
+    DATABASE_URL = "sqlite:///sales.db"
+    use_postgres = False
 
-DATABASE_URL = f"sqlite:///{DB_PATH}"
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False},
-    pool_size=20,
-    max_overflow=30,
-    pool_pre_ping=True,
-    echo=False
-)
+# Engine với NullPool cho SQLite (tránh lock) và pool_pre_ping cho PostgreSQL
+if use_postgres:
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True, echo=False)
+else:
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False}, poolclass=NullPool, echo=False)
+
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
-# ---------- CLOUDINARY (DÙNG SECRETS HOẶC HARDCODE TẠM) ----------
+# ---------- CLOUDINARY (CHỈ DÙNG SECRETS, KHÔNG HARDCODE) ----------
 if os.environ.get('STREAMLIT_CLOUD') or os.environ.get('STREAMLIT_RUNTIME'):
     try:
         CLOUD_NAME = st.secrets["CLOUD_NAME"]
@@ -41,14 +49,14 @@ if os.environ.get('STREAMLIT_CLOUD') or os.environ.get('STREAMLIT_RUNTIME'):
         st.error("❌ Thiếu Cloudinary secrets. Vui lòng cấu hình trên Streamlit Cloud.")
         st.stop()
 else:
-    # Thay bằng thông tin thật của bạn (nếu chạy local)
-    CLOUD_NAME = "dw6f9wege"
-    API_KEY = "353532489943778"
-    API_SECRET = "cZWPsYQBsJ-y5g2fXLj8WUW7X-w"
+    # Khi chạy local, bạn có thể dùng biến môi trường hoặc hardcode tạm (nhưng không push lên git)
+    # Tốt nhất dùng .env và load_dotenv, nhưng để đơn giản tôi đặt mặc định rỗng
+    st.error("❌ Chạy local cần cấu hình Cloudinary. Vui lòng tạo file .env hoặc set biến môi trường.")
+    st.stop()
 
 cloudinary.config(cloud_name=CLOUD_NAME, api_key=API_KEY, api_secret=API_SECRET)
 
-# ---------- CSS GIAO DIỆN ĐẸP ----------
+# ---------- CSS ----------
 st.markdown("""
 <style>
 .block-container { padding-top: 1rem; }
@@ -71,12 +79,6 @@ st.markdown("""
 }
 .price { font-size: 1.3em; color: #4CAF50; font-weight: bold; }
 .stock { color: #ff9800; }
-.cart-item {
-    background: #1e1e1e;
-    border-radius: 10px;
-    padding: 10px;
-    margin-bottom: 5px;
-}
 </style>
 """, unsafe_allow_html=True)
 
@@ -130,7 +132,12 @@ class Setting(Base):
     key = Column(String, primary_key=True)
     value = Column(String)
 
-Base.metadata.create_all(engine)
+# Tạo bảng an toàn
+try:
+    Base.metadata.create_all(engine)
+except Exception as e:
+    st.error(f"Lỗi tạo bảng: {e}")
+    st.stop()
 
 # ---------- HÀM TIỆN ÍCH ----------
 def hash_password(pwd): return bcrypt.hashpw(pwd.encode(), bcrypt.gensalt()).decode()
@@ -147,31 +154,39 @@ def init_data():
             if not s.query(Setting).filter_by(key=k).first():
                 s.add(Setting(key=k, value=v))
         s.commit()
-init_data()
+
+# Khởi tạo dữ liệu an toàn
+try:
+    init_data()
+except Exception as e:
+    st.error(f"Lỗi khởi tạo dữ liệu: {e}")
+    st.stop()
 
 def upload_image(file): return cloudinary.uploader.upload(file, folder="sales_app")['secure_url']
 
-@st.cache_data(ttl=5, show_spinner=False)
+# Cache ngắn (TTL=2s) chỉ cho danh sách sản phẩm (không stock vì stock thay đổi nhanh)
+@st.cache_data(ttl=2, show_spinner=False)
 def get_products(search=""):
     with SessionLocal() as s:
         q = s.query(Product)
         if search: q = q.filter(or_(Product.name.contains(search), Product.barcode.contains(search)))
+        # Lưu ý: stock được lấy từ DB mỗi lần, không cache stock riêng
         return [{'id':p.id,'name':p.name,'price':p.price,'stock':p.stock,'image_url':p.image_url,'barcode':p.barcode} for p in q.all()]
 
-@st.cache_data(ttl=5, show_spinner=False)
+@st.cache_data(ttl=10, show_spinner=False)
 def get_customers():
     with SessionLocal() as s: return [{'id':c.id,'name':c.name,'phone':c.phone,'total_spent':c.total_spent,'total_purchases':c.total_purchases,'type':c.type} for c in s.query(Customer).all()]
 
-@st.cache_data(ttl=5, show_spinner=False)
+@st.cache_data(ttl=10, show_spinner=False)
 def get_loyal(): return [{'name':c.name,'phone':c.phone,'total_spent':c.total_spent} for c in SessionLocal().query(Customer).filter_by(type='loyal').all()]
 
-@st.cache_data(ttl=5, show_spinner=False)
+@st.cache_data(ttl=10, show_spinner=False)
 def get_vip(limit=10): return [{'name':c.name,'phone':c.phone,'total_spent':c.total_spent,'type':c.type} for c in SessionLocal().query(Customer).order_by(Customer.total_spent.desc()).limit(limit).all()]
 
-@st.cache_data(ttl=5, show_spinner=False)
+@st.cache_data(ttl=10, show_spinner=False)
 def get_sales(): return [{'id':s.id,'date':s.date,'final_amount':s.final_amount} for s in SessionLocal().query(Sale).all()]
 
-@st.cache_data(ttl=5, show_spinner=False)
+@st.cache_data(ttl=10, show_spinner=False)
 def get_top_products():
     with SessionLocal() as s:
         items = s.query(SaleItem.product_id, func.sum(SaleItem.quantity).label('qty')).group_by(SaleItem.product_id).all()
@@ -180,12 +195,12 @@ def get_top_products():
         pmap = {p.id:p.name for p in prods}
         return sorted([{'name':pmap[pid],'total_qty':qty} for pid,qty in items], key=lambda x:x['total_qty'], reverse=True)[:10]
 
-@st.cache_data(ttl=5, show_spinner=False)
+@st.cache_data(ttl=10, show_spinner=False)
 def get_settings(): return {k.value:v.value for k,v in SessionLocal().query(Setting).all()}
 
 def clear_cache(): st.cache_data.clear()
 
-# ---------------- NGHIỆP VỤ GHI ----------------
+# ---------------- NGHIỆP VỤ GHI (CÓ ROW LOCK NẾU POSTGRES) ----------------
 def add_product(name,price,stock,img,barcode):
     with SessionLocal() as s:
         s.add(Product(name=name,price=price,stock=stock,image_url=upload_image(img) if img else "",barcode=barcode))
@@ -194,7 +209,7 @@ def add_product(name,price,stock,img,barcode):
 
 def update_product(pid,name,price,stock,img,barcode):
     with SessionLocal() as s:
-        p = s.query(Product).get(pid)
+        p = s.get(Product, pid)
         if p:
             p.name, p.price, p.stock, p.barcode = name, price, stock, barcode
             if img: p.image_url = upload_image(img)
@@ -215,7 +230,7 @@ def add_customer(name,phone):
 
 def update_customer_type(cid):
     with SessionLocal() as s:
-        c = s.query(Customer).get(cid)
+        c = s.get(Customer, cid)
         if c:
             sets = get_settings()
             loyal_spent = float(sets.get('loyal_min_spent',5000000))
@@ -230,15 +245,19 @@ def update_customer_type(cid):
 
 def get_discount(cid):
     with SessionLocal() as s:
-        c = s.query(Customer).get(cid)
+        c = s.get(Customer, cid)
         if not c: return 0
         return float(get_settings().get(f"{c.type}_discount",0))
 
 def record_sale(cid, cart_items, disc_percent):
     with SessionLocal() as s:
         try:
-            for pid,qty,price in cart_items:
-                p = s.query(Product).get(pid)
+            # Nếu dùng PostgreSQL, thực hiện row lock
+            for pid, qty, price in cart_items:
+                if use_postgres:
+                    p = s.query(Product).filter_by(id=pid).with_for_update().first()
+                else:
+                    p = s.get(Product, pid)
                 if not p or p.stock < qty:
                     raise ValueError(f"Sản phẩm {p.name if p else '?'} không đủ hàng")
             total = sum(q*p for _,q,p in cart_items)
@@ -247,10 +266,10 @@ def record_sale(cid, cart_items, disc_percent):
             sale = Sale(customer_id=cid, total_amount=total, discount=disc_amt, final_amount=final)
             s.add(sale)
             s.flush()
-            for pid,qty,price in cart_items:
+            for pid, qty, price in cart_items:
                 s.add(SaleItem(sale_id=sale.id, product_id=pid, quantity=qty, price=price))
                 s.query(Product).filter_by(id=pid).update({Product.stock: Product.stock - qty})
-            c = s.query(Customer).get(cid)
+            c = s.get(Customer, cid)
             c.total_spent += final
             c.total_purchases += 1
             s.commit()
@@ -275,35 +294,51 @@ def upload_csv(file):
     for c in get_customers(): update_customer_type(c['id'])
     clear_cache()
 
+# ---------- PDF VỚI REPORTLAB (HỖ TRỢ TIẾNG VIỆT) ----------
 def gen_pdf(sale_id, cus_name, cus_phone, cus_type, items, total, discount, final):
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", size=12)
-    pdf.cell(200,10,"HÓA ĐƠN BÁN HÀNG",ln=1,align='C')
-    pdf.cell(200,10,f"Mã HD: {sale_id}",ln=1)
-    pdf.cell(200,10,f"Khách hàng: {cus_name} - {cus_phone} ({cus_type})",ln=1)
-    pdf.cell(200,10,f"Ngày: {datetime.now().strftime('%d/%m/%Y %H:%M')}",ln=1)
-    pdf.ln(10)
-    pdf.set_font("Arial",'B',10)
-    pdf.cell(80,10,"Sản phẩm",1); pdf.cell(30,10,"SL",1); pdf.cell(40,10,"Đơn giá",1); pdf.cell(40,10,"Thành tiền",1); pdf.ln()
-    pdf.set_font("Arial",size=10)
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+    # Đăng ký font Unicode (cần có file DejaVuSans.ttf trong thư mục fonts)
+    font_path = "fonts/DejaVuSans.ttf"
+    if os.path.exists(font_path):
+        pdfmetrics.registerFont(TTFont('DejaVu', font_path))
+        c.setFont('DejaVu', 12)
+    else:
+        c.setFont('Helvetica', 12)
+    # Tiêu đề
+    c.drawString(50, height - 50, "HÓA ĐƠN BÁN HÀNG")
+    c.drawString(50, height - 70, f"Mã HD: {sale_id}")
+    c.drawString(50, height - 90, f"Khách hàng: {cus_name} - {cus_phone} ({cus_type})")
+    c.drawString(50, height - 110, f"Ngày: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    y = height - 140
+    # Bảng
+    c.drawString(50, y, "Sản phẩm")
+    c.drawString(200, y, "SL")
+    c.drawString(250, y, "Đơn giá")
+    c.drawString(320, y, "Thành tiền")
+    y -= 20
     for it in items:
-        pdf.cell(80,10,it['name'],1)
-        pdf.cell(30,10,str(it['qty']),1)
-        pdf.cell(40,10,f"{int(it['price'])}",1)
-        pdf.cell(40,10,f"{int(it['qty']*it['price'])}",1)
-        pdf.ln()
-    pdf.ln(5)
-    pdf.cell(200,10,f"Tổng tiền: {int(total)} VNĐ",ln=1)
-    pdf.cell(200,10,f"Giảm giá: {int(discount)} VNĐ",ln=1)
-    pdf.set_font("Arial",'B',12)
-    pdf.cell(200,10,f"Thực thu: {int(final)} VNĐ",ln=1)
-    buf = io.BytesIO()
-    buf.write(pdf.output(dest='S').encode('latin1'))
-    buf.seek(0)
-    return buf
+        c.drawString(50, y, it['name'][:30])
+        c.drawString(200, y, str(it['qty']))
+        c.drawString(250, y, f"{int(it['price']):,}")
+        c.drawString(320, y, f"{int(it['qty']*it['price']):,}")
+        y -= 20
+        if y < 50:
+            c.showPage()
+            y = height - 50
+    y -= 20
+    c.drawString(50, y, f"Tổng tiền: {int(total):,} VNĐ")
+    y -= 20
+    c.drawString(50, y, f"Giảm giá: {int(discount):,} VNĐ")
+    y -= 20
+    c.setFont('Helvetica-Bold', 12)
+    c.drawString(50, y, f"Thực thu: {int(final):,} VNĐ")
+    c.save()
+    buffer.seek(0)
+    return buffer
 
-# ---------- LOGIN ----------
+# ---------- LOGIN & SESSION TIMEOUT ----------
 def login(username, password):
     with SessionLocal() as s:
         u = s.query(User).filter_by(username=username).first()
@@ -321,6 +356,8 @@ def get_or_create_guest():
 
 # ---------- STREAMLIT APP ----------
 st.set_page_config(page_title="Hệ thống bán hàng Pro", layout="wide")
+
+# Khởi tạo session state
 if 'logged_in' not in st.session_state: st.session_state.logged_in = False
 if 'role' not in st.session_state: st.session_state.role = None
 if 'cart' not in st.session_state: st.session_state.cart = []
@@ -328,6 +365,16 @@ if 'sale_step' not in st.session_state: st.session_state.sale_step = 1
 if 'search' not in st.session_state: st.session_state.search = ""
 if 'current_customer' not in st.session_state: st.session_state.current_customer = get_or_create_guest()
 if 'barcode_scanner' not in st.session_state: st.session_state.barcode_scanner = ""
+if 'last_active' not in st.session_state: st.session_state.last_active = datetime.now()
+
+# Session timeout (30 phút)
+if st.session_state.logged_in:
+    if (datetime.now() - st.session_state.last_active).seconds > 1800:
+        st.session_state.logged_in = False
+        st.warning("Phiên đăng nhập hết hạn, vui lòng đăng nhập lại.")
+        st.rerun()
+    else:
+        st.session_state.last_active = datetime.now()
 
 if not st.session_state.logged_in:
     st.title("🔐 Đăng nhập")
