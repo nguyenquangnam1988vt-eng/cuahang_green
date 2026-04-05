@@ -1,8 +1,10 @@
 streamlit>=1.28.0
 pandas>=2.0.0
 sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0   # nếu dùng PostgreSQL, bỏ comment dòng này nếu dùng SQLite
 bcrypt>=4.0.0
 cloudinary>=1.33.0
 plotly>=5.17.0
 fpdf2>=2.7.0
 Pillow>=10.0.0
+python-dotenv>=1.0.0
