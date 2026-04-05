@@ -464,3 +464,278 @@ elif menu_selection == "⚙️ Cài đặt (Admin)":
                     s.value = val
                     session.commit()
                     st.success(f"✅ Cập nhật {s.key} thành công")
+# ---------- PHẦN 3a: DATABASE NÂNG CAO VÀ MODELS MỚI ----------
+
+from sqlalchemy import Boolean
+
+# Bảng Nhà cung cấp
+class Supplier(Base):
+    __tablename__ = 'suppliers'
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False, unique=True)
+    phone = Column(String, nullable=True)
+    email = Column(String, nullable=True)
+    address = Column(String, nullable=True)
+
+# Bảng Phiếu nhập kho
+class StockEntry(Base):
+    __tablename__ = 'stock_entries'
+    id = Column(Integer, primary_key=True)
+    product_id = Column(Integer, ForeignKey('products.id'))
+    supplier_id = Column(Integer, ForeignKey('suppliers.id'))
+    quantity = Column(Integer, nullable=False)
+    price_per_unit = Column(Float, nullable=False)
+    date = Column(DateTime, default=datetime.now)
+    staff_username = Column(String, ForeignKey('users.username'))
+    product = relationship("Product")
+    supplier = relationship("Supplier")
+    staff = relationship("User")
+
+# Thêm cột cảnh báo tồn kho trong sản phẩm
+if not hasattr(Product, 'min_stock_alert'):
+    Product.min_stock_alert = Column(Integer, default=5)  # Mức tồn kho cảnh báo mặc định
+
+# Tạo bảng mới
+Base.metadata.create_all(engine)
+
+# ---------- HÀM TIỆN ÍCH MỚI ----------
+def add_supplier(name, phone="", email="", address=""):
+    with SessionLocal() as session:
+        supplier = Supplier(name=name, phone=phone, email=email, address=address)
+        session.add(supplier)
+        session.commit()
+
+def get_suppliers():
+    with SessionLocal() as session:
+        return session.query(Supplier).all()
+
+def record_stock_entry(product_id, supplier_id, quantity, price_per_unit, staff_username):
+    with SessionLocal() as session:
+        entry = StockEntry(
+            product_id=product_id,
+            supplier_id=supplier_id,
+            quantity=quantity,
+            price_per_unit=price_per_unit,
+            staff_username=staff_username
+        )
+        session.add(entry)
+        # Cập nhật tồn kho sản phẩm
+        product = session.query(Product).filter_by(id=product_id).first()
+        product.stock += quantity
+        session.commit()
+
+def get_stock_entries():
+    with SessionLocal() as session:
+        return session.query(StockEntry).all()
+
+def check_stock_alerts():
+    alerts = []
+    with SessionLocal() as session:
+        products = session.query(Product).all()
+        for p in products:
+            if p.stock <= (p.min_stock_alert or 5):
+                alerts.append({
+                    "name": p.name,
+                    "stock": p.stock,
+                    "min_alert": p.min_stock_alert
+                })
+    return alerts
+# ---------- PHẦN 3b: UI QUẢN LÝ NHÀ CUNG CẤP VÀ NHẬP KHO ----------
+
+import streamlit as st
+from datetime import datetime
+
+st.set_page_config(
+    page_title="POS KiotViet - Nâng cao",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Sidebar menu
+st.sidebar.title("Quản lý POS")
+menu = st.sidebar.radio("Điều hướng", ["Bán hàng", "Sản phẩm", "Nhập kho", "Nhà cung cấp", "Cảnh báo tồn kho"])
+
+# ----- NHÀ CUNG CẤP -----
+if menu == "Nhà cung cấp":
+    st.header("Quản lý Nhà Cung Cấp")
+
+    # Form thêm nhà cung cấp
+    with st.form("add_supplier_form"):
+        st.subheader("Thêm nhà cung cấp mới")
+        name = st.text_input("Tên nhà cung cấp")
+        phone = st.text_input("Số điện thoại")
+        email = st.text_input("Email")
+        address = st.text_input("Địa chỉ")
+        submitted = st.form_submit_button("Thêm nhà cung cấp")
+        if submitted:
+            if name.strip() == "":
+                st.error("Tên nhà cung cấp không được để trống")
+            else:
+                add_supplier(name, phone, email, address)
+                st.success(f"Thêm nhà cung cấp '{name}' thành công!")
+
+    # Danh sách nhà cung cấp
+    st.subheader("Danh sách nhà cung cấp")
+    suppliers = get_suppliers()
+    if suppliers:
+        supplier_data = [{"ID": s.id, "Tên": s.name, "Điện thoại": s.phone, "Email": s.email, "Địa chỉ": s.address} for s in suppliers]
+        st.table(supplier_data)
+    else:
+        st.info("Chưa có nhà cung cấp nào")
+
+# ----- NHẬP KHO -----
+if menu == "Nhập kho":
+    st.header("Nhập kho sản phẩm")
+
+    products = get_products()
+    suppliers = get_suppliers()
+
+    if not products or not suppliers:
+        st.warning("Vui lòng đảm bảo đã có sản phẩm và nhà cung cấp trước khi nhập kho")
+    else:
+        with st.form("stock_entry_form"):
+            st.subheader("Phiếu nhập kho")
+            product_choice = st.selectbox("Chọn sản phẩm", [(p.id, p.name) for p in products], format_func=lambda x: x[1])
+            supplier_choice = st.selectbox("Chọn nhà cung cấp", [(s.id, s.name) for s in suppliers], format_func=lambda x: x[1])
+            quantity = st.number_input("Số lượng nhập", min_value=1, step=1)
+            price_per_unit = st.number_input("Giá nhập/1 đơn vị", min_value=0.0, step=100.0)
+            staff_username = st.text_input("Nhân viên thực hiện", value="admin")
+            submitted = st.form_submit_button("Nhập kho")
+            if submitted:
+                record_stock_entry(
+                    product_id=product_choice[0],
+                    supplier_id=supplier_choice[0],
+                    quantity=quantity,
+                    price_per_unit=price_per_unit,
+                    staff_username=staff_username
+                )
+                st.success(f"Nhập kho sản phẩm '{product_choice[1]}' từ nhà cung cấp '{supplier_choice[1]}' thành công!")
+
+    # Hiển thị phiếu nhập kho
+    st.subheader("Danh sách phiếu nhập kho gần đây")
+    entries = get_stock_entries()
+    if entries:
+        entry_data = []
+        for e in entries[-10:][::-1]:  # 10 phiếu gần nhất
+            entry_data.append({
+                "ID": e.id,
+                "Sản phẩm": e.product.name,
+                "Nhà cung cấp": e.supplier.name,
+                "Số lượng": e.quantity,
+                "Giá/Đơn vị": e.price_per_unit,
+                "Nhân viên": e.staff_username,
+                "Ngày nhập": e.date.strftime("%d-%m-%Y %H:%M")
+            })
+        st.table(entry_data)
+    else:
+        st.info("Chưa có phiếu nhập kho nào")
+
+# ----- CẢNH BÁO TỒN KHO -----
+if menu == "Cảnh báo tồn kho":
+    st.header("Cảnh báo tồn kho")
+    alerts = check_stock_alerts()
+    if alerts:
+        st.warning("Những sản phẩm dưới mức tồn kho cảnh báo:")
+        alert_data = [{"Sản phẩm": a["name"], "Tồn kho hiện tại": a["stock"], "Mức cảnh báo": a["min_alert"]} for a in alerts]
+        st.table(alert_data)
+    else:
+        st.success("Tất cả sản phẩm đều đủ tồn kho")
+# ---------- PHẦN 3c: UI NÂNG CAO POS KIOTVIET ----------
+import streamlit as st
+from datetime import datetime
+import pandas as pd
+
+st.set_page_config(
+    page_title="POS KiotViet - Full",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Sidebar menu chính
+st.sidebar.title("POS KiotViet - Dashboard")
+menu = st.sidebar.radio("Điều hướng chính", [
+    "Bán hàng", "Sản phẩm", "Nhập kho", "Nhà cung cấp", "Khách hàng", "Báo cáo", "Cài đặt"
+])
+
+# ----- HỆ THỐNG PHÂN QUYỀN -----
+user_role = st.sidebar.selectbox("Chọn vai trò", ["Admin", "Staff"], index=0)
+
+# ----- BÁN HÀNG -----
+if menu == "Bán hàng":
+    st.header("Bán hàng POS")
+
+    products = get_products()
+    if not products:
+        st.warning("Chưa có sản phẩm nào! Vui lòng thêm sản phẩm trước.")
+    else:
+        df_cart = pd.DataFrame(columns=["Sản phẩm", "Số lượng", "Giá bán", "Thành tiền"])
+        with st.form("sale_form"):
+            st.subheader("Chọn sản phẩm bán")
+            product_choice = st.selectbox("Sản phẩm", [(p.id, p.name) for p in products], format_func=lambda x: x[1])
+            quantity = st.number_input("Số lượng", min_value=1, step=1)
+            discount = st.number_input("Giảm giá (%)", min_value=0, max_value=100, step=1)
+            customer_name = st.text_input("Tên khách hàng", value="Khách lẻ")
+            submitted = st.form_submit_button("Thêm vào giỏ")
+            if submitted:
+                add_to_cart(product_choice[0], quantity, discount, customer_name)
+                st.success(f"Đã thêm {quantity} x {product_choice[1]} vào giỏ hàng!")
+
+        # Hiển thị giỏ hàng
+        st.subheader("Giỏ hàng hiện tại")
+        cart_items = get_cart(customer_name)
+        if cart_items:
+            total_amount = 0
+            for item in cart_items:
+                item_total = item['price'] * item['quantity'] * (1 - item['discount']/100)
+                total_amount += item_total
+                df_cart = pd.concat([df_cart, pd.DataFrame([{
+                    "Sản phẩm": item['name'],
+                    "Số lượng": item['quantity'],
+                    "Giá bán": item['price'],
+                    "Thành tiền": item_total
+                }])], ignore_index=True)
+            st.table(df_cart)
+            st.markdown(f"**Tổng thanh toán:** {total_amount:,.0f} đ")
+            if st.button("Thanh toán và in hóa đơn"):
+                process_payment(customer_name)
+                st.success("Thanh toán thành công! Hóa đơn đã được in.")
+        else:
+            st.info("Giỏ hàng trống.")
+
+# ----- BÁO CÁO DOANH THU -----
+if menu == "Báo cáo":
+    st.header("Báo cáo và thống kê")
+
+    st.subheader("Doanh thu theo ngày")
+    revenue_data = get_revenue_data()  # giả sử trả về danh sách dict: date, total
+    if revenue_data:
+        df_rev = pd.DataFrame(revenue_data)
+        df_rev['Ngày'] = pd.to_datetime(df_rev['date']).dt.strftime("%d-%m-%Y")
+        st.bar_chart(df_rev.set_index('Ngày')['total'])
+    else:
+        st.info("Chưa có dữ liệu doanh thu.")
+
+    st.subheader("Top sản phẩm bán chạy")
+    top_products = get_top_products()
+    if top_products:
+        df_top = pd.DataFrame(top_products)
+        st.table(df_top)
+    else:
+        st.info("Chưa có dữ liệu sản phẩm bán chạy.")
+
+    st.subheader("Khách hàng VIP")
+    vip_customers = get_vip_customers()
+    if vip_customers:
+        df_vip = pd.DataFrame(vip_customers)
+        st.table(df_vip)
+    else:
+        st.info("Chưa có khách VIP nào.")
+
+# ----- CÀI ĐẶT -----
+if menu == "Cài đặt":
+    st.header("Cài đặt hệ thống POS")
+    st.subheader("Quản lý người dùng")
+    users = get_users()
+    st.table([{"Tên": u.username, "Vai trò": u.role} for u in users])
+    st.subheader("Cài đặt khác")
+    st.info("Các tính năng nâng cao sẽ được triển khai ở phiên bản sau.")
