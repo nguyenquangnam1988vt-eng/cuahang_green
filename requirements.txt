@@ -6,3 +6,4 @@ plotly
 fpdf2
 psycopg2-binary
 cloudinary
+dotenv
