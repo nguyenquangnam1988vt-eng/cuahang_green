@@ -365,7 +365,6 @@ def login(username, password):
 
 # ---------- STREAMLIT APP ----------
 st.set_page_config(page_title="Hệ thống bán hàng Pro", layout="wide")
-st.set_option('client.displayEnabled', False)  # Giảm rerun không cần thiết
 
 # Khởi tạo session_state
 if 'logged_in' not in st.session_state:
