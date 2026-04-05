@@ -32,7 +32,7 @@ Base = declarative_base()
 engine = create_engine(DATABASE_URL, echo=False, future=True)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
-# ---------- MODELS (BỔ SUNG NHẬP KHO, CÔNG NỢ) ----------
+# ---------- MODELS (BỔ SUNG BẢNG PAYMENT) ----------
 class User(Base):
     __tablename__ = "users"
     username = Column(String, primary_key=True)
@@ -44,20 +44,20 @@ class Product(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
     price = Column(Float, nullable=False)          # Giá bán
-    cost = Column(Float, default=0.0)              # Giá nhập (mới)
+    cost = Column(Float, default=0.0)              # Giá vốn bình quân
     stock = Column(Integer, nullable=False)
     image_url = Column(String)
     barcode = Column(String, unique=True, nullable=True)
 
-class InventoryTransaction(Base):   # Bảng lưu lịch sử nhập/xuất kho
+class InventoryTransaction(Base):
     __tablename__ = "inventory_transactions"
     id = Column(Integer, primary_key=True)
     product_id = Column(Integer, ForeignKey("products.id"))
     quantity = Column(Integer)      # Dương = nhập, Âm = xuất
     price = Column(Float)           # Giá tại thời điểm nhập/xuất (giá nhập hoặc giá bán)
     transaction_date = Column(DateTime, default=datetime.now)
-    note = Column(String, nullable=True)  # "Nhập kho", "Bán hàng", "Điều chỉnh"
-    sale_id = Column(Integer, ForeignKey("sales.id"), nullable=True)  # Liên kết với hóa đơn nếu là xuất bán
+    note = Column(String, nullable=True)
+    sale_id = Column(Integer, ForeignKey("sales.id"), nullable=True)
 
 class Customer(Base):
     __tablename__ = "customers"
@@ -66,19 +66,27 @@ class Customer(Base):
     phone = Column(String, unique=True)
     total_spent = Column(Float, default=0)
     total_purchases = Column(Integer, default=0)
-    debt = Column(Float, default=0.0)          # Công nợ (mới)
+    debt = Column(Float, default=0.0)
     type = Column(String, default='regular')
+
+class Payment(Base):
+    __tablename__ = "payments"
+    id = Column(Integer, primary_key=True)
+    customer_id = Column(Integer, ForeignKey("customers.id"))
+    amount = Column(Float)          # Số tiền thanh toán (dương)
+    payment_date = Column(DateTime, default=datetime.now)
+    note = Column(String, nullable=True)
 
 class Sale(Base):
     __tablename__ = "sales"
     id = Column(Integer, primary_key=True)
     customer_id = Column(Integer, ForeignKey("customers.id"))
     date = Column(DateTime, default=datetime.now)
-    total_amount = Column(Float)   # Tổng tiền trước giảm giá
+    total_amount = Column(Float)
     discount = Column(Float)
-    final_amount = Column(Float)   # Thực thu
-    paid_amount = Column(Float, default=0.0)   # Số tiền khách đã trả (mới)
-    debt_after = Column(Float, default=0.0)    # Công nợ sau hóa đơn
+    final_amount = Column(Float)
+    paid_amount = Column(Float, default=0.0)
+    debt_after = Column(Float, default=0.0)
     customer = relationship("Customer")
 
 class SaleItem(Base):
@@ -87,14 +95,13 @@ class SaleItem(Base):
     sale_id = Column(Integer, ForeignKey("sales.id"))
     product_id = Column(Integer, ForeignKey("products.id"))
     quantity = Column(Integer)
-    price = Column(Float)   # Giá bán tại thời điểm bán
+    price = Column(Float)
 
 class Setting(Base):
     __tablename__ = "settings"
     key = Column(String, primary_key=True)
     value = Column(String)
 
-# Tạo bảng
 Base.metadata.create_all(engine)
 
 # ---------- HÀM TIỆN ÍCH ----------
@@ -122,7 +129,6 @@ def init_data():
 
 init_data()
 
-# ---------- HÀM XỬ LÝ ẢNH ----------
 def upload_image_to_cloudinary(image_file):
     if image_file is None:
         return ""
@@ -130,14 +136,13 @@ def upload_image_to_cloudinary(image_file):
                                         transformation=[{"width": 500, "height": 500, "crop": "limit"}])
     return result.get("secure_url", "")
 
-# ---------- QUẢN LÝ SẢN PHẨM (CÓ NHẬP KHO) ----------
+# ---------- QUẢN LÝ SẢN PHẨM ----------
 def add_product(name: str, price: float, cost: float, stock: int, image_file=None, barcode=None):
     with SessionLocal() as session:
         image_url = upload_image_to_cloudinary(image_file) if image_file else ""
         product = Product(name=name, price=price, cost=cost, stock=stock, image_url=image_url, barcode=barcode)
         session.add(product)
         session.flush()
-        # Ghi nhận giao dịch nhập kho ban đầu
         if stock > 0:
             trans = InventoryTransaction(product_id=product.id, quantity=stock, price=cost, note="Nhập kho lần đầu")
             session.add(trans)
@@ -146,42 +151,46 @@ def add_product(name: str, price: float, cost: float, stock: int, image_file=Non
 def update_product(product_id: int, name: str, price: float, cost: float, stock: int, image_file=None, barcode=None):
     with SessionLocal() as session:
         product = session.get(Product, product_id)
-        if product:
-            # Tính toán chênh lệch stock để ghi nhận nhập/xuất
-            diff = stock - product.stock
-            if diff != 0:
-                note = "Nhập kho (điều chỉnh)" if diff > 0 else "Xuất kho (điều chỉnh)"
-                trans = InventoryTransaction(product_id=product_id, quantity=diff, price=cost if diff>0 else product.price, note=note)
-                session.add(trans)
-            product.name = name
-            product.price = price
-            product.cost = cost
-            product.stock = stock
-            if image_file:
-                product.image_url = upload_image_to_cloudinary(image_file)
-            if barcode:
-                product.barcode = barcode
-            session.commit()
+        if not product:
+            return
+        diff = stock - product.stock
+        if diff != 0:
+            note = "Nhập kho (điều chỉnh)" if diff > 0 else "Xuất kho (điều chỉnh)"
+            trans = InventoryTransaction(product_id=product_id, quantity=diff, price=cost if diff>0 else product.price, note=note)
+            session.add(trans)
+        product.name = name
+        product.price = price
+        product.cost = cost
+        product.stock = stock
+        if image_file:
+            product.image_url = upload_image_to_cloudinary(image_file)
+        if barcode:
+            product.barcode = barcode
+        session.commit()
 
 def delete_product(product_id: int):
     with SessionLocal() as session:
         session.query(Product).filter_by(id=product_id).delete()
         session.commit()
 
-# HÀM NHẬP KHO RIÊNG (TĂNG SỐ LƯỢNG, GHI NHẬN GIAO DỊCH)
 def import_stock(product_id: int, quantity: int, import_price: float, note: str = "Nhập kho"):
     with SessionLocal() as session:
         product = session.get(Product, product_id)
-        if product:
-            product.stock += quantity
-            product.cost = import_price  # Cập nhật giá nhập mới (có thể lấy trung bình, nhưng đơn giản là ghi đè)
-            trans = InventoryTransaction(product_id=product_id, quantity=quantity, price=import_price, note=note)
-            session.add(trans)
-            session.commit()
-            return True
-    return False
+        if not product:
+            return False
+        # Tính giá vốn bình quân mới
+        total_value = product.stock * product.cost
+        new_total_value = total_value + (quantity * import_price)
+        new_stock = product.stock + quantity
+        new_avg_cost = new_total_value / new_stock if new_stock > 0 else 0
+        product.stock = new_stock
+        product.cost = new_avg_cost
+        trans = InventoryTransaction(product_id=product_id, quantity=quantity, price=import_price, note=note)
+        session.add(trans)
+        session.commit()
+        return True
 
-# ---------- QUẢN LÝ KHÁCH HÀNG (CÔNG NỢ) ----------
+# ---------- QUẢN LÝ KHÁCH HÀNG & CÔNG NỢ ----------
 def add_customer(name: str, phone: str):
     with SessionLocal() as session:
         cust = Customer(name=name, phone=phone)
@@ -191,16 +200,6 @@ def add_customer(name: str, phone: str):
 def get_customers():
     with SessionLocal() as session:
         return session.query(Customer).all()
-
-def update_customer_debt(customer_id: int, amount_change: float):
-    """amount_change: dương nếu khách trả nợ, âm nếu khách nợ thêm (khi mua hàng)"""
-    with SessionLocal() as session:
-        cust = session.get(Customer, customer_id)
-        if cust:
-            cust.debt += amount_change
-            session.commit()
-            return cust.debt
-    return None
 
 def update_customer_type(customer_id: int):
     with SessionLocal() as session:
@@ -229,20 +228,39 @@ def get_discount_for_customer(customer_id: Optional[int]) -> float:
         disc = float(session.query(Setting).filter_by(key=key).first().value)
         return disc
 
-# ---------- BÁN HÀNG VÀ CÔNG NỢ ----------
+def add_payment(customer_id: int, amount: float, note: str = "Khách trả nợ"):
+    with SessionLocal() as session:
+        cust = session.get(Customer, customer_id)
+        if cust and amount > 0 and cust.debt >= amount:
+            cust.debt -= amount
+            payment = Payment(customer_id=customer_id, amount=amount, note=note)
+            session.add(payment)
+            session.commit()
+            return True
+    return False
+
+def get_payment_history(customer_id: int):
+    with SessionLocal() as session:
+        return session.query(Payment).filter_by(customer_id=customer_id).order_by(Payment.payment_date).all()
+
+# ---------- BÁN HÀNG (CÓ RACE CONDITION FIX) ----------
 def record_sale(customer_id: int, cart_items: List[Dict], discount_percent: float, paid_amount: float = 0):
     """
     cart_items: list of dicts with keys: product_id, quantity, price (giá bán)
-    paid_amount: số tiền khách trả ngay
     Trả về (sale_id, final_amount, debt_after)
     """
     with SessionLocal() as session:
+        # 1. Kiểm tra tồn kho và khóa row nếu dùng PostgreSQL
+        for item in cart_items:
+            product = session.get(Product, item['product_id'])
+            if not product or product.stock < item['quantity']:
+                raise ValueError(f"Sản phẩm {product.name if product else '?'} không đủ hàng (còn {product.stock if product else 0})")
         total = sum(item['price'] * item['quantity'] for item in cart_items)
         discount_amount = total * discount_percent / 100
         final = total - discount_amount
-        debt = final - paid_amount  # Nếu khách trả thiếu thì nợ thêm
-        if debt < 0: debt = 0  # Không âm (trả thừa coi như không nợ, có thể xử lý riêng)
-        # Lấy công nợ hiện tại của khách
+        debt = final - paid_amount
+        if debt < 0:
+            debt = 0
         cust = session.get(Customer, customer_id)
         old_debt = cust.debt if cust else 0
         new_debt = old_debt + debt
@@ -250,19 +268,16 @@ def record_sale(customer_id: int, cart_items: List[Dict], discount_percent: floa
                     final_amount=final, paid_amount=paid_amount, debt_after=new_debt)
         session.add(sale)
         session.flush()
+        # 2. Trừ kho và ghi nhận giao dịch
         for item in cart_items:
+            product = session.get(Product, item['product_id'])
+            product.stock -= item['quantity']
             sale_item = SaleItem(sale_id=sale.id, product_id=item['product_id'],
                                  quantity=item['quantity'], price=item['price'])
             session.add(sale_item)
-            # Cập nhật tồn kho
-            session.query(Product).filter_by(id=item['product_id']).update(
-                {Product.stock: Product.stock - item['quantity']}
-            )
-            # Ghi nhận giao dịch xuất kho
             trans = InventoryTransaction(product_id=item['product_id'], quantity=-item['quantity'],
                                          price=item['price'], note=f"Bán hàng - HĐ {sale.id}", sale_id=sale.id)
             session.add(trans)
-        # Cập nhật thông tin khách hàng
         if cust:
             cust.total_spent += final
             cust.total_purchases += 1
@@ -270,17 +285,6 @@ def record_sale(customer_id: int, cart_items: List[Dict], discount_percent: floa
         session.commit()
         update_customer_type(customer_id)
         return sale.id, final, new_debt
-
-def add_payment(customer_id: int, amount: float, note: str = "Khách trả nợ"):
-    """Thanh toán công nợ, ghi nhận giao dịch riêng (có thể tạo một bảng payments)"""
-    with SessionLocal() as session:
-        cust = session.get(Customer, customer_id)
-        if cust and amount > 0:
-            cust.debt -= amount
-            # Tạo một giao dịch đặc biệt? Ở đây ta chỉ cập nhật công nợ, có thể lưu vào bảng Payment nếu muốn.
-            session.commit()
-            return True
-    return False
 
 # ---------- CÁC HÀM LẤY DỮ LIỆU CÓ CACHE ----------
 @st.cache_data(ttl=30)
@@ -365,8 +369,8 @@ def login(username, password):
 
 # ---------- STREAMLIT APP ----------
 st.set_page_config(page_title="Hệ thống bán hàng Pro", layout="wide")
+st.set_option('client.displayEnabled', False)
 
-# Khởi tạo session_state
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
     st.session_state.role = None
@@ -389,7 +393,6 @@ if not st.session_state.logged_in:
                 st.error("Sai tên hoặc mật khẩu")
     st.stop()
 
-# Sidebar menu
 menu_options = ["🏠 Trang chủ", "📦 Quản lý sản phẩm", "🛒 Bán hàng", "👥 Khách hàng & Công nợ", "📊 Báo cáo", "⚙️ Cài đặt (Admin)"]
 menu = st.sidebar.radio("Chức năng", menu_options)
 
@@ -409,7 +412,6 @@ if menu == "🏠 Trang chủ":
     col3.metric("Khách hàng", total_customers)
     col4.metric("Tổng công nợ", f"{total_debt:,.0f} VNĐ")
     st.metric("Doanh thu hôm nay", f"{revenue_today:,.0f} VNĐ")
-
     st.subheader("Top 10 sản phẩm bán chạy")
     with SessionLocal() as session:
         top = session.query(
@@ -426,11 +428,10 @@ if menu == "🏠 Trang chủ":
     else:
         st.info("Chưa có dữ liệu bán hàng")
 
-# -------------------- QUẢN LÝ SẢN PHẨM (CÓ NHẬP KHO) --------------------
+# -------------------- QUẢN LÝ SẢN PHẨM & NHẬP KHO --------------------
 elif menu == "📦 Quản lý sản phẩm":
     st.title("Quản lý sản phẩm & Nhập kho")
     tab1, tab2, tab3 = st.tabs(["Danh sách sản phẩm", "Thêm/Sửa sản phẩm", "Nhập kho"])
-    
     with tab1:
         st.subheader("Danh sách sản phẩm")
         search = st.text_input("Tìm kiếm theo tên hoặc mã vạch", key="search_prod")
@@ -438,7 +439,6 @@ elif menu == "📦 Quản lý sản phẩm":
         if not products:
             st.info("Không có sản phẩm")
         else:
-            # Phân trang
             page_size = 20
             total_pages = (len(products) + page_size - 1) // page_size
             page = st.number_input("Trang", min_value=1, max_value=total_pages, value=1, step=1)
@@ -449,14 +449,13 @@ elif menu == "📦 Quản lý sản phẩm":
                 cols[0].image(p.image_url or "https://via.placeholder.com/50", width=50)
                 cols[1].write(f"**{p.name}**")
                 cols[2].write(f"{p.price:,.0f}đ")
-                cols[3].write(f"Nhập: {p.cost:,.0f}đ")
+                cols[3].write(f"Vốn: {p.cost:,.0f}đ")
                 cols[4].write(p.stock)
                 cols[5].write(p.barcode or "")
                 if cols[6].button("Xóa", key=f"del_{p.id}"):
                     delete_product(p.id)
                     clear_cache()
                     st.rerun()
-    
     with tab2:
         st.subheader("Thêm / Cập nhật sản phẩm")
         with st.form("product_form"):
@@ -484,14 +483,13 @@ elif menu == "📦 Quản lý sản phẩm":
                     st.rerun()
                 except IntegrityError:
                     st.error("Mã vạch đã tồn tại!")
-    
     with tab3:
-        st.subheader("Nhập kho (tăng số lượng)")
+        st.subheader("Nhập kho (tăng số lượng, cập nhật giá vốn bình quân)")
         products = get_all_products_cached()
         if not products:
             st.warning("Chưa có sản phẩm nào")
         else:
-            prod_dict = {f"{p.id} - {p.name} (tồn: {p.stock})": p for p in products}
+            prod_dict = {f"{p.id} - {p.name} (tồn: {p.stock}, giá vốn: {p.cost:,.0f})": p for p in products}
             selected_prod = st.selectbox("Chọn sản phẩm", list(prod_dict.keys()))
             prod = prod_dict[selected_prod]
             qty_import = st.number_input("Số lượng nhập", min_value=1, step=1, value=1)
@@ -500,15 +498,14 @@ elif menu == "📦 Quản lý sản phẩm":
             if st.button("Xác nhận nhập kho"):
                 if import_stock(prod.id, qty_import, import_price, note):
                     clear_cache()
-                    st.success(f"Đã nhập {qty_import} sản phẩm {prod.name} với giá {import_price:,.0f}đ")
+                    st.success(f"Đã nhập {qty_import} sản phẩm {prod.name} với giá {import_price:,.0f}đ, giá vốn mới: {prod.cost:,.0f}đ")
                     st.rerun()
                 else:
                     st.error("Lỗi khi nhập kho")
 
-# -------------------- BÁN HÀNG (CÓ CÔNG NỢ) --------------------
+# -------------------- BÁN HÀNG --------------------
 elif menu == "🛒 Bán hàng":
     st.title("Bán hàng")
-    # Bước 1: Chọn khách hàng
     customers = get_customers_cached()
     cust_options = {f"{c.name} - {c.phone} (nợ: {c.debt:,.0f}đ)": c.id for c in customers}
     cust_options["Khách lẻ (không lưu)"] = None
@@ -521,7 +518,6 @@ elif menu == "🛒 Bán hàng":
     else:
         customer_id = None
 
-    # Giỏ hàng
     st.subheader("Giỏ hàng")
     if st.session_state.cart:
         df_cart = pd.DataFrame(st.session_state.cart)
@@ -545,7 +541,6 @@ elif menu == "🛒 Bán hàng":
         with colA:
             if st.button("Thanh toán", use_container_width=True):
                 if not customer_id:
-                    # Tạo khách lẻ mới (có thể không lưu nợ, nhưng vẫn tạo)
                     add_customer("Khách lẻ", "")
                     new_cust = get_customers_cached()[-1]
                     customer_id = new_cust.id
@@ -569,12 +564,9 @@ elif menu == "🛒 Bán hàng":
                 st.rerun()
     else:
         st.info("Giỏ hàng trống")
-    
-    # Thêm sản phẩm vào giỏ
     st.subheader("Thêm sản phẩm")
     search = st.text_input("Tìm kiếm (tên/mã vạch)", key="search_sale")
     products = get_all_products_cached(search)
-    # Giới hạn hiển thị 20 sản phẩm để tránh lag
     products_display = products[:20]
     cols = st.columns(4)
     for idx, p in enumerate(products_display):
@@ -586,7 +578,6 @@ elif menu == "🛒 Bán hàng":
             st.write(f"📦 Tồn: {p.stock}")
             qty = st.number_input("SL", min_value=1, max_value=p.stock, value=1, key=f"qty_{p.id}", label_visibility="collapsed")
             if st.button(f"➕ Thêm", key=f"add_{p.id}"):
-                # Kiểm tra trùng
                 found = False
                 for item in st.session_state.cart:
                     if item['product_id'] == p.id:
@@ -609,7 +600,7 @@ elif menu == "🛒 Bán hàng":
 # -------------------- KHÁCH HÀNG & CÔNG NỢ --------------------
 elif menu == "👥 Khách hàng & Công nợ":
     st.title("Quản lý khách hàng và công nợ")
-    tab1, tab2 = st.tabs(["Danh sách khách hàng", "Thanh toán công nợ"])
+    tab1, tab2, tab3 = st.tabs(["Danh sách khách hàng", "Thanh toán công nợ", "Lịch sử thanh toán"])
     with tab1:
         customers = get_customers_cached()
         if customers:
@@ -644,13 +635,27 @@ elif menu == "👥 Khách hàng & Công nợ":
             else:
                 selected_cust = st.selectbox("Chọn khách hàng", cust_with_debt, format_func=lambda x: f"{x.name} - nợ {x.debt:,.0f}đ")
                 pay_amount = st.number_input("Số tiền thanh toán", min_value=0.0, max_value=float(selected_cust.debt), value=float(selected_cust.debt), step=10000.0)
+                note = st.text_input("Ghi chú (tùy chọn)", value="Thanh toán nợ")
                 if st.button("Xác nhận thanh toán"):
-                    if add_payment(selected_cust.id, pay_amount):
+                    if add_payment(selected_cust.id, pay_amount, note):
                         clear_cache()
                         st.success(f"Đã thanh toán {pay_amount:,.0f}đ cho khách {selected_cust.name}")
                         st.rerun()
                     else:
-                        st.error("Lỗi")
+                        st.error("Lỗi: số tiền vượt quá công nợ hoặc khách không tồn tại")
+    with tab3:
+        st.subheader("Lịch sử thanh toán của khách hàng")
+        customers = get_customers_cached()
+        if customers:
+            selected_cust = st.selectbox("Chọn khách hàng", customers, format_func=lambda x: f"{x.name} - {x.phone}")
+            payments = get_payment_history(selected_cust.id)
+            if payments:
+                df_pay = pd.DataFrame([(p.payment_date, p.amount, p.note) for p in payments], columns=["Ngày", "Số tiền", "Ghi chú"])
+                st.dataframe(df_pay)
+            else:
+                st.info("Chưa có giao dịch thanh toán nào")
+        else:
+            st.info("Chưa có khách hàng")
 
 # -------------------- BÁO CÁO --------------------
 elif menu == "📊 Báo cáo":
@@ -686,7 +691,7 @@ elif menu == "📊 Báo cáo":
             st.dataframe(df)
         else:
             st.info("Chưa có giao dịch")
-    else:  # Công nợ khách hàng
+    else:
         customers = get_customers_cached()
         if customers:
             df_debt = pd.DataFrame([(c.name, c.phone, c.debt) for c in customers if c.debt > 0], columns=["Tên", "SĐT", "Công nợ"])
@@ -713,7 +718,6 @@ elif menu == "⚙️ Cài đặt (Admin)":
         with st.form("settings_form"):
             for key, label in key_labels.items():
                 val = st.text_input(label, value=settings.get(key, ""))
-                # Lưu tạm vào session để cập nhật sau
                 st.session_state[f"set_{key}"] = val
             if st.form_submit_button("Lưu cài đặt"):
                 with SessionLocal() as session:
