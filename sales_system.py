@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 load_dotenv()  # Đọc biến môi trường từ .env
 
 # ---------- CẤU HÌNH ----------
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///sales.db")
+DATABASE_URL = st.secrets["DATABASE_URL"]
 if "sqlite" in DATABASE_URL:
     st.warning("⚠️ Bạn đang dùng SQLite. SQLite **không hỗ trợ row lock** thực sự, có thể gây race condition khi nhiều người dùng. Hãy chuyển sang PostgreSQL cho production.")
     # SQLite không hỗ trợ with_for_update, sẽ bỏ qua lock
