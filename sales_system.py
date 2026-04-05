@@ -355,7 +355,19 @@ elif menu_selection == "📦 Quản lý sản phẩm":
 # --- Bán hàng ---
 elif menu_selection == "🛒 Bán hàng":
     st.title("🛒 Bán hàng")
-    # Chọn khách hàng
+    # --- Upload khách từ CSV ---
+    st.subheader("📥 Tải khách hàng từ file CSV")
+    uploaded_file = st.file_uploader("Chọn file CSV (Tên, SĐT)", type=["csv"])
+    if uploaded_file:
+        df_customers = pd.read_csv(uploaded_file)
+        for idx, row in df_customers.iterrows():
+            name = str(row.get("Tên", "")).strip()
+            phone = str(row.get("SĐT", "")).strip()
+            if name and phone:
+                add_customer(name, phone)
+        st.success(f"✅ Đã thêm {len(df_customers)} khách từ file CSV")
+    
+    # --- Chọn khách hàng ---
     customers = get_customers()
     cust_options = ["Khách lẻ"] + [f"{c.id} - {c.name}" for c in customers]
     selected_customer = st.selectbox("Chọn khách hàng", cust_options)
