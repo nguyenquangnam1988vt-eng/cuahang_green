@@ -14,10 +14,7 @@ import io
 import tempfile
 
 # ---------- CẤU HÌNH DATABASE (SQLite + pool) ----------
-if os.environ.get('STREAMLIT_CLOUD'):
-    DB_PATH = os.path.join(tempfile.gettempdir(), 'sales.db')
-else:
-    DB_PATH = 'sales.db'
+DB_PATH = os.path.join(os.getcwd(), 'sales.db')
 
 DATABASE_URL = f"sqlite:///{DB_PATH}"
 engine = create_engine(
