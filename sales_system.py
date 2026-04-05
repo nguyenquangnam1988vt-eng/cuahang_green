@@ -458,9 +458,21 @@ elif menu_selection == "⚙️ Cài đặt (Admin)":
         st.title("⚙️ Cài đặt hệ thống")
         with SessionLocal() as session:
             settings = session.query(Setting).all()
+            # Bản đồ key -> nhãn tiếng Việt
+            key_labels = {
+                "loyal_min_spent": "Tiêu tối thiểu cho khách thân thiết (VNĐ)",
+                "loyal_min_purchases": "Số lần mua tối thiểu cho khách thân thiết",
+                "longtime_min_spent": "Tiêu tối thiểu cho khách lâu năm (VNĐ)",
+                "longtime_min_purchases": "Số lần mua tối thiểu cho khách lâu năm",
+                "loyal_discount": "Chiết khấu cho khách thân thiết (%)",
+                "longtime_discount": "Chiết khấu cho khách lâu năm (%)",
+                "regular_discount": "Chiết khấu cho khách thông thường (%)"
+            }
+            
             for s in settings:
-                val = st.text_input(s.key, value=s.value, key=s.key)
-                if st.button(f"Cập nhật {s.key}", key=f"btn_{s.key}"):
+                label = key_labels.get(s.key, s.key)  # dùng label tiếng Việt nếu có
+                val = st.text_input(label, value=s.value, key=s.key)
+                if st.button(f"Cập nhật {label}", key=f"btn_{s.key}"):
                     s.value = val
                     session.commit()
-                    st.success(f"✅ Cập nhật {s.key} thành công")
+                    st.success(f"✅ Cập nhật {label} thành công")
