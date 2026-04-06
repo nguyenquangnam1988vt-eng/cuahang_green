@@ -3,9 +3,9 @@ import pandas as pd
 import os
 import bcrypt
 from datetime import datetime, date
-from sqlalchemy import create_engine, Column, String, Integer, Float, DateTime, ForeignKey, Text, or_, func
+from sqlalchemy import create_engine, Column, String, Integer, Float, DateTime, ForeignKey, Text, or_, func, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 import cloudinary
 import cloudinary.uploader
 import plotly.express as px
@@ -16,7 +16,6 @@ from typing import List, Dict, Optional
 
 # ---------- CẤU HÌNH STREAMLIT ----------
 st.set_page_config(page_title="Hệ thống bán hàng Pro", layout="wide")
-# Không dùng st.set_option nữa (gây lỗi trong Streamlit 1.20+)
 
 # ---------- LOAD BIẾN MÔI TRƯỜNG ----------
 if os.environ.get('STREAMLIT_CLOUD') or os.environ.get('STREAMLIT_RUNTIME'):
@@ -134,7 +133,22 @@ class Setting(Base):
     key = Column(String, primary_key=True)
     value = Column(String)
 
+# ---------- KIỂM TRA VÀ CẬP NHẬT SCHEMA (THÊM CỘT DEBT NẾU THIẾU) ----------
+def ensure_schema_up_to_date():
+    """Kiểm tra và thêm cột debt vào bảng customers nếu chưa có (cho database cũ)."""
+    inspector = inspect(engine)
+    if 'customers' in inspector.get_table_names():
+        columns = [col['name'] for col in inspector.get_columns('customers')]
+        if 'debt' not in columns:
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE customers ADD COLUMN debt FLOAT DEFAULT 0.0"))
+                conn.commit()
+                st.info("Đã thêm cột debt vào bảng customers (nâng cấp database).")
+    # Có thể thêm các cột khác nếu cần
+
+# Tạo bảng nếu chưa có, sau đó kiểm tra schema
 Base.metadata.create_all(engine)
+ensure_schema_up_to_date()
 
 # ---------- HÀM TIỆN ÍCH ----------
 def hash_password(password: str) -> str:
@@ -313,7 +327,7 @@ def record_sale(customer_id: int, cart_items: List[Dict], discount_percent: floa
         update_customer_type(customer_id)
         return sale.id, final, new_debt
 
-# ---------- CÁC HÀM LẤY DỮ LIỆU CÓ CACHE ----------
+# ---------- CÁC HÀM LẤY DỮ LIỆU CÓ CACHE (ĐÃ SỬA LỖI SCALAR NONE) ----------
 @st.cache_data(ttl=30)
 def get_all_products_cached(search_term=""):
     with SessionLocal() as session:
@@ -429,12 +443,23 @@ menu = st.sidebar.radio("Chức năng", menu_options)
 if menu == "🏠 Trang chủ":
     st.title("Dashboard tổng quan")
     with SessionLocal() as session:
-        total_revenue = session.query(func.sum(Sale.final_amount)).scalar() or 0
-        total_customers = session.query(func.count(Customer.id)).scalar() or 0
-        total_products = session.query(func.count(Product.id)).scalar() or 0
-        total_debt = session.query(func.sum(Customer.debt)).scalar() or 0
+        # Sửa lỗi scalar None
+        total_revenue = session.query(func.sum(Sale.final_amount)).scalar()
+        total_revenue = total_revenue if total_revenue is not None else 0.0
+        
+        total_customers = session.query(func.count(Customer.id)).scalar()
+        total_customers = total_customers if total_customers is not None else 0
+        
+        total_products = session.query(func.count(Product.id)).scalar()
+        total_products = total_products if total_products is not None else 0
+        
+        total_debt = session.query(func.sum(Customer.debt)).scalar()
+        total_debt = total_debt if total_debt is not None else 0.0
+        
         today = date.today()
-        revenue_today = session.query(func.sum(Sale.final_amount)).filter(func.date(Sale.date) == today).scalar() or 0
+        revenue_today = session.query(func.sum(Sale.final_amount)).filter(func.date(Sale.date) == today).scalar()
+        revenue_today = revenue_today if revenue_today is not None else 0.0
+        
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Tổng doanh thu", f"{total_revenue:,.0f} VNĐ")
     col2.metric("Sản phẩm", total_products)
