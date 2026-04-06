@@ -16,7 +16,7 @@ from typing import List, Dict, Optional
 
 # ---------- CẤU HÌNH STREAMLIT ----------
 st.set_page_config(page_title="Hệ thống bán hàng Pro", layout="wide")
-st.set_option('browser.gatherUsageStats', False)   # Tắt gửi thống kê ẩn danh
+# Không dùng st.set_option nữa (gây lỗi trong Streamlit 1.20+)
 
 # ---------- LOAD BIẾN MÔI TRƯỜNG ----------
 if os.environ.get('STREAMLIT_CLOUD') or os.environ.get('STREAMLIT_RUNTIME'):
@@ -313,13 +313,12 @@ def record_sale(customer_id: int, cart_items: List[Dict], discount_percent: floa
         update_customer_type(customer_id)
         return sale.id, final, new_debt
 
-# ---------- CÁC HÀM LẤY DỮ LIỆU CÓ CACHE (ĐÃ SỬA FILTER) ----------
+# ---------- CÁC HÀM LẤY DỮ LIỆU CÓ CACHE ----------
 @st.cache_data(ttl=30)
 def get_all_products_cached(search_term=""):
     with SessionLocal() as session:
         query = session.query(Product)
         if search_term:
-            # Tránh lỗi khi barcode None bằng cách kiểm tra riêng
             query = query.filter(
                 or_(
                     Product.name.contains(search_term),
