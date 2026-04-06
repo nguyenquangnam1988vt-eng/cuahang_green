@@ -2,16 +2,16 @@ import streamlit as st
 import pandas as pd
 import os
 import bcrypt
-import time
+import csv
+import io
 from datetime import datetime, date
 from sqlalchemy import create_engine, Column, String, Integer, Float, DateTime, ForeignKey, Text, or_, func, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
-from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
+from sqlalchemy.exc import IntegrityError, ProgrammingError
 import cloudinary
 import cloudinary.uploader
 import plotly.express as px
 from fpdf import FPDF
-import io
 from dotenv import load_dotenv
 from typing import List, Dict, Optional
 
@@ -38,7 +38,7 @@ else:
         st.error("❌ Bạn chưa set DATABASE_URL hoặc Cloudinary API trong file .env")
         st.stop()
 
-# ---------- CẤU HÌNH CLOUDINARY (CACHE) ----------
+# ---------- CẤU HÌNH CLOUDINARY ----------
 @st.cache_resource
 def init_cloudinary():
     cloudinary.config(
@@ -47,10 +47,9 @@ def init_cloudinary():
         api_secret=API_SECRET
     )
     return True
-
 init_cloudinary()
 
-# ---------- CẤU HÌNH DATABASE (CACHE) ----------
+# ---------- CẤU HÌNH DATABASE ----------
 @st.cache_resource
 def get_engine():
     return create_engine(DATABASE_URL, echo=False, future=True)
@@ -96,6 +95,7 @@ class Customer(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
     phone = Column(String, unique=True)
+    address = Column(String, default="")          # ← Địa chỉ khách hàng
     total_spent = Column(Float, default=0)
     total_purchases = Column(Integer, default=0)
     debt = Column(Float, default=0.0)
@@ -117,8 +117,8 @@ class Sale(Base):
     total_amount = Column(Float)
     discount = Column(Float)
     final_amount = Column(Float)
-    paid_amount = Column(Float, default=0.0)   # ← cột mới
-    debt_after = Column(Float, default=0.0)    # ← cột mới
+    paid_amount = Column(Float, default=0.0)
+    debt_after = Column(Float, default=0.0)
     customer = relationship("Customer")
 
 class SaleItem(Base):
@@ -134,15 +134,11 @@ class Setting(Base):
     key = Column(String, primary_key=True)
     value = Column(String)
 
-# ---------- KIỂM TRA VÀ TẠO BẢNG/CỘT (AN TOÀN) ----------
+# ---------- KIỂM TRA VÀ CẬP NHẬT SCHEMA ----------
 def ensure_tables_and_columns():
-    """
-    Kiểm tra sự tồn tại của bảng products, customers, sales
-    và thêm các cột cần thiết nếu thiếu.
-    """
     inspector = inspect(engine)
-    
-    # Xử lý bảng products
+
+    # Products: thêm cột cost
     if 'products' in inspector.get_table_names():
         columns = [col['name'] for col in inspector.get_columns('products')]
         if 'cost' not in columns:
@@ -151,20 +147,24 @@ def ensure_tables_and_columns():
             st.info("✅ Đã thêm cột 'cost' vào bảng products.")
     else:
         Base.metadata.tables['products'].create(engine, checkfirst=True)
-        st.info("✅ Bảng 'products' được tạo mới (kèm cột cost).")
-    
-    # Xử lý bảng customers
+        st.info("✅ Bảng 'products' được tạo mới.")
+
+    # Customers: thêm cột debt và address
     if 'customers' in inspector.get_table_names():
         columns = [col['name'] for col in inspector.get_columns('customers')]
         if 'debt' not in columns:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE customers ADD COLUMN debt FLOAT DEFAULT 0.0"))
             st.info("✅ Đã thêm cột 'debt' vào bảng customers.")
+        if 'address' not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE customers ADD COLUMN address TEXT DEFAULT ''"))
+            st.info("✅ Đã thêm cột 'address' vào bảng customers.")
     else:
         Base.metadata.tables['customers'].create(engine, checkfirst=True)
-        st.info("✅ Bảng 'customers' được tạo mới (kèm cột debt).")
-    
-    # Xử lý bảng sales
+        st.info("✅ Bảng 'customers' được tạo mới.")
+
+    # Sales: thêm cột paid_amount, debt_after
     if 'sales' in inspector.get_table_names():
         columns = [col['name'] for col in inspector.get_columns('sales')]
         if 'paid_amount' not in columns:
@@ -177,12 +177,9 @@ def ensure_tables_and_columns():
             st.info("✅ Đã thêm cột 'debt_after' vào bảng sales.")
     else:
         Base.metadata.tables['sales'].create(engine, checkfirst=True)
-        st.info("✅ Bảng 'sales' được tạo mới (kèm paid_amount, debt_after).")
+        st.info("✅ Bảng 'sales' được tạo mới.")
 
-# Gọi hàm kiểm tra ngay sau khi có engine
 ensure_tables_and_columns()
-
-# Tạo các bảng còn lại nếu chưa có (không ảnh hưởng đến các bảng đã xử lý)
 Base.metadata.create_all(engine)
 
 # ---------- HÀM TIỆN ÍCH ----------
@@ -209,9 +206,8 @@ def init_data():
                     session.add(Setting(key=k, value=v))
             session.commit()
         except ProgrammingError as e:
-            st.error(f"Lỗi database khi khởi tạo dữ liệu: {e}. Hãy kiểm tra kết nối và schema.")
+            st.error(f"Lỗi khởi tạo dữ liệu: {e}")
             st.stop()
-
 init_data()
 
 def upload_image_to_cloudinary(image_file):
@@ -222,7 +218,7 @@ def upload_image_to_cloudinary(image_file):
                                             transformation=[{"width": 500, "height": 500, "crop": "limit"}])
         return result.get("secure_url", "")
     except Exception as e:
-        st.error(f"Lỗi upload ảnh: {e}")
+        st.error(f"Upload ảnh thất bại: {e}")
         return ""
 
 # ---------- QUẢN LÝ SẢN PHẨM ----------
@@ -278,10 +274,26 @@ def import_stock(product_id: int, quantity: int, import_price: float, note: str 
         session.commit()
         return True
 
-# ---------- QUẢN LÝ KHÁCH HÀNG & CÔNG NỢ ----------
-def add_customer(name: str, phone: str):
+# ---------- QUẢN LÝ KHÁCH HÀNG ----------
+def get_or_create_customer(name: str, phone: str, address: str = "") -> int:
+    """Lấy customer_id nếu đã tồn tại theo SĐT, nếu không thì tạo mới (type='regular')."""
     with SessionLocal() as session:
-        cust = Customer(name=name, phone=phone)
+        cust = session.query(Customer).filter_by(phone=phone).first()
+        if cust:
+            # Cập nhật địa chỉ nếu có thay đổi
+            if address and cust.address != address:
+                cust.address = address
+                session.commit()
+            return cust.id
+        else:
+            new_cust = Customer(name=name, phone=phone, address=address, type='regular')
+            session.add(new_cust)
+            session.commit()
+            return new_cust.id
+
+def add_customer(name: str, phone: str, address: str = ""):
+    with SessionLocal() as session:
+        cust = Customer(name=name, phone=phone, address=address)
         session.add(cust)
         session.commit()
 
@@ -290,6 +302,7 @@ def get_customers():
         return session.query(Customer).all()
 
 def update_customer_type(customer_id: int):
+    """Cập nhật loại khách dựa trên total_spent và total_purchases."""
     with SessionLocal() as session:
         cust = session.get(Customer, customer_id)
         if cust:
@@ -331,6 +344,32 @@ def get_payment_history(customer_id: int):
     with SessionLocal() as session:
         return session.query(Payment).filter_by(customer_id=customer_id).order_by(Payment.payment_date).all()
 
+def import_loyal_customers_from_csv(file):
+    """Import khách hàng thân thiết từ CSV (cột name, phone, address tùy chọn)."""
+    if not file:
+        st.error("Chưa chọn file CSV")
+        return 0
+    added_count = 0
+    decoded = file.getvalue().decode("utf-8").splitlines()
+    reader = csv.DictReader(decoded)
+    with SessionLocal() as session:
+        for row in reader:
+            name = row.get("name", "").strip()
+            phone = row.get("phone", "").strip()
+            address = row.get("address", "").strip()
+            if not name or not phone:
+                continue
+            # Kiểm tra trùng SĐT
+            if session.query(Customer).filter_by(phone=phone).first():
+                continue
+            cust = Customer(name=name, phone=phone, address=address, type='loyal')
+            session.add(cust)
+            added_count += 1
+        session.commit()
+    st.success(f"✅ Đã thêm {added_count} khách hàng thân thiết từ CSV")
+    clear_cache()
+    return added_count
+
 # ---------- BÁN HÀNG ----------
 def record_sale(customer_id: int, cart_items: List[Dict], discount_percent: float, paid_amount: float = 0):
     with SessionLocal() as session:
@@ -363,10 +402,11 @@ def record_sale(customer_id: int, cart_items: List[Dict], discount_percent: floa
             cust.total_purchases += 1
             cust.debt = new_debt
         session.commit()
+        # Cập nhật loại khách hàng sau khi giao dịch
         update_customer_type(customer_id)
         return sale.id, final, new_debt
 
-# ---------- CÁC HÀM LẤY DỮ LIỆU CÓ CACHE (XỬ LÝ LỖI) ----------
+# ---------- CÁC HÀM CACHE (XỬ LÝ LỖI) ----------
 def safe_query(query_func, *args, **kwargs):
     try:
         return query_func(*args, **kwargs)
@@ -421,14 +461,17 @@ def clear_cache():
     st.cache_data.clear()
 
 # ---------- HÀM TẠO PDF ----------
-def generate_pdf_invoice(sale_id, customer_name, customer_phone, customer_type, items, total, discount, final, paid, debt):
+def generate_pdf_invoice(sale_id, customer_name, customer_phone, customer_address, customer_type,
+                         items, total, discount, final, paid, debt):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", 'B', 16)
     pdf.cell(200, 10, "HÓA ĐƠN BÁN HÀNG", ln=True, align='C')
     pdf.set_font("Arial", size=12)
     pdf.cell(200, 10, f"Mã HD: {sale_id}", ln=True)
-    pdf.cell(200, 10, f"Khách hàng: {customer_name} - {customer_phone} ({customer_type})", ln=True)
+    pdf.cell(200, 10, f"Khách hàng: {customer_name} - {customer_phone}", ln=True)
+    pdf.cell(200, 10, f"Địa chỉ: {customer_address}", ln=True)
+    pdf.cell(200, 10, f"Loại khách: {customer_type}", ln=True)
     pdf.cell(200, 10, f"Ngày: {datetime.now().strftime('%d/%m/%Y %H:%M')}", ln=True)
     pdf.ln(10)
     pdf.cell(80, 10, "Sản phẩm", 1)
@@ -519,7 +562,7 @@ if menu == "🏠 Trang chủ":
     else:
         st.info("Chưa có dữ liệu bán hàng")
 
-# -------------------- QUẢN LÝ SẢN PHẨM & NHẬP KHO --------------------
+# -------------------- QUẢN LÝ SẢN PHẨM --------------------
 elif menu == "📦 Quản lý sản phẩm":
     st.title("Quản lý sản phẩm & Nhập kho")
     tab1, tab2, tab3 = st.tabs(["Danh sách sản phẩm", "Thêm/Sửa sản phẩm", "Nhập kho"])
@@ -594,73 +637,111 @@ elif menu == "📦 Quản lý sản phẩm":
                 else:
                     st.error("Lỗi khi nhập kho")
 
-# -------------------- BÁN HÀNG --------------------
+# -------------------- BÁN HÀNG (CẢI TIẾN) --------------------
 elif menu == "🛒 Bán hàng":
     st.title("Bán hàng")
-    customers = safe_query(get_customers_cached)
-    cust_options = {f"{c.name} - {c.phone} (nợ: {c.debt:,.0f}đ)": c.id for c in customers}
-    cust_options["Khách lẻ (không lưu)"] = None
-    selected_cust_label = st.selectbox("Chọn khách hàng", list(cust_options.keys()))
-    customer_id = cust_options[selected_cust_label]
-    if customer_id:
-        cust_info = next((c for c in customers if c.id == customer_id), None)
-        if cust_info and cust_info.debt > 0:
-            st.warning(f"Khách hàng đang nợ {cust_info.debt:,.0f} VNĐ. Có thể thanh toán nợ ở mục Khách hàng.")
-    else:
-        customer_id = None
 
+    # Phần giỏ hàng
     st.subheader("Giỏ hàng")
     if st.session_state.cart:
         df_cart = pd.DataFrame(st.session_state.cart)
         df_cart["Thành tiền"] = df_cart["price"] * df_cart["quantity"]
         st.dataframe(df_cart[["name", "quantity", "price", "Thành tiền"]])
         total = sum(item['price']*item['quantity'] for item in st.session_state.cart)
-        discount = get_discount_for_customer(customer_id)
-        disc_amount = total * discount / 100
-        final = total - disc_amount
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Tổng tiền", f"{total:,.0f} VNĐ")
-        col2.metric(f"Giảm giá ({discount}%)", f"-{disc_amount:,.0f} VNĐ")
-        col3.metric("Thực thu", f"{final:,.0f} VNĐ")
-        paid = st.number_input("Tiền khách đưa", min_value=0.0, value=final, step=10000.0)
-        debt = final - paid
-        if debt > 0:
-            st.warning(f"Khách còn nợ {debt:,.0f} VNĐ")
-        elif debt < 0:
-            st.info(f"Thối lại {abs(debt):,.0f} VNĐ")
-        colA, colB = st.columns(2)
-        with colA:
-            if st.button("Thanh toán", use_container_width=True):
-                if not customer_id:
-                    add_customer("Khách lẻ", "")
-                    clear_cache()
-                    customers = safe_query(get_customers_cached)
-                    customer_id = customers[-1].id if customers else None
-                if customer_id:
-                    try:
-                        sale_id, final_amt, debt_after = record_sale(customer_id, st.session_state.cart, discount, paid)
-                        cust_name = next((c.name for c in customers if c.id==customer_id), "Khách lẻ")
-                        cust_phone = next((c.phone for c in customers if c.id==customer_id), "")
-                        cust_type = next((c.type for c in customers if c.id==customer_id), "regular")
-                        pdf_file = generate_pdf_invoice(sale_id, cust_name, cust_phone, cust_type,
-                                                         st.session_state.cart, total, disc_amount, final_amt, paid, debt_after)
-                        st.download_button("📥 Tải hóa đơn PDF", pdf_file, file_name=f"invoice_{sale_id}.pdf", mime="application/pdf")
-                        st.success("Thanh toán thành công!")
-                        st.session_state.cart = []
-                        clear_cache()
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Lỗi: {e}")
-                else:
-                    st.error("Không thể tạo khách hàng")
-        with colB:
-            if st.button("Hủy giỏ hàng"):
-                st.session_state.cart = []
-                st.rerun()
+
+        # Hiển thị tổng tiền tạm tính (chưa giảm giá)
+        st.metric("Tổng tiền hàng", f"{total:,.0f} VNĐ")
     else:
         st.info("Giỏ hàng trống")
-    st.subheader("Thêm sản phẩm")
-    search = st.text_input("Tìm kiếm (tên/mã vạch)", key="search_sale")
+
+    # Form thông tin khách hàng (luôn hiển thị)
+    st.subheader("Thông tin khách hàng")
+    with st.form("customer_info"):
+        phone = st.text_input("📞 Số điện thoại", placeholder="Nhập số điện thoại để tra cứu")
+        # Khi nhập phone, có thể tra cứu tự động bằng session state, nhưng vì trong form nên dùng nút bấm
+        # Hoặc dùng st.form_submit_button và xử lý bên ngoài. Tạm thời để đơn giản, cho phép nhập tên và địa chỉ.
+        name = st.text_input("👤 Tên khách hàng")
+        address = st.text_input("🏠 Địa chỉ")
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            search_btn = st.form_submit_button("🔍 Tra cứu")
+        with col_btn2:
+            submit_btn = st.form_submit_button("✅ Thanh toán", type="primary")
+
+    # Xử lý tra cứu khách hàng
+    if search_btn and phone:
+        with SessionLocal() as session:
+            cust = session.query(Customer).filter_by(phone=phone).first()
+            if cust:
+                st.success(f"Tìm thấy: {cust.name} - Loại: {cust.type} - Nợ: {cust.debt:,.0f}đ")
+                # Gợi ý điền tên và địa chỉ
+                st.session_state.cust_name = cust.name
+                st.session_state.cust_address = cust.address
+                st.rerun()
+            else:
+                st.warning("Khách hàng chưa có trong hệ thống. Vui lòng nhập tên và địa chỉ để tạo mới.")
+
+    # Nếu đã có session_state từ tra cứu, hiển thị lại
+    if 'cust_name' in st.session_state:
+        name = st.session_state.cust_name
+        address = st.session_state.cust_address
+    else:
+        name = name if 'name' in locals() else ""
+        address = address if 'address' in locals() else ""
+
+    # Xử lý thanh toán
+    if submit_btn:
+        if not st.session_state.cart:
+            st.error("Giỏ hàng trống, không thể thanh toán.")
+        elif not phone:
+            st.error("Vui lòng nhập số điện thoại khách hàng.")
+        elif not name:
+            st.error("Vui lòng nhập tên khách hàng (hoặc tra cứu trước).")
+        else:
+            # Tạo hoặc lấy customer_id
+            customer_id = get_or_create_customer(name, phone, address)
+            # Lấy thông tin khách sau khi tạo/lấy
+            with SessionLocal() as session:
+                cust = session.get(Customer, customer_id)
+                if cust:
+                    st.success(f"Khách hàng: {cust.name} ({cust.type}) - Công nợ hiện tại: {cust.debt:,.0f}đ")
+                    discount_percent = get_discount_for_customer(customer_id)
+                    st.info(f"Áp dụng giảm giá {discount_percent}% cho loại khách {cust.type}")
+
+                    # Tính toán thanh toán
+                    total = sum(item['price']*item['quantity'] for item in st.session_state.cart)
+                    discount_amount = total * discount_percent / 100
+                    final_amount = total - discount_amount
+                    st.write(f"Tổng tiền: {total:,.0f}đ | Giảm: {discount_amount:,.0f}đ | Cần thanh toán: {final_amount:,.0f}đ")
+
+                    paid_amount = st.number_input("Tiền khách đưa", min_value=0.0, value=final_amount, step=10000.0, key="paid_input")
+                    debt = final_amount - paid_amount
+                    if debt > 0:
+                        st.warning(f"Khách còn nợ {debt:,.0f}đ")
+                    elif debt < 0:
+                        st.info(f"Thối lại {abs(debt):,.0f}đ")
+
+                    if st.button("Xác nhận thanh toán", key="confirm_payment"):
+                        try:
+                            sale_id, final_amt, debt_after = record_sale(customer_id, st.session_state.cart, discount_percent, paid_amount)
+                            # Tạo PDF
+                            pdf_file = generate_pdf_invoice(sale_id, cust.name, cust.phone, cust.address, cust.type,
+                                                            st.session_state.cart, total, discount_amount, final_amt, paid_amount, debt_after)
+                            st.download_button("📥 Tải hóa đơn PDF", pdf_file, file_name=f"invoice_{sale_id}.pdf", mime="application/pdf")
+                            st.success(f"Thanh toán thành công! Mã hóa đơn: {sale_id}. Công nợ mới: {debt_after:,.0f}đ")
+                            # Xóa giỏ hàng và reset session
+                            st.session_state.cart = []
+                            if 'cust_name' in st.session_state:
+                                del st.session_state.cust_name
+                                del st.session_state.cust_address
+                            clear_cache()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Lỗi khi ghi nhận bán hàng: {e}")
+
+    # Khu vực thêm sản phẩm (luôn hiển thị)
+    st.subheader("Thêm sản phẩm vào giỏ")
+    search = st.text_input("🔍 Tìm kiếm (tên/mã vạch)", key="search_sale")
     products = safe_query(get_all_products_cached, search)
     products_display = products[:20]
     cols = st.columns(4)
@@ -692,6 +773,11 @@ elif menu == "🛒 Bán hàng":
                     })
                 st.rerun()
 
+    # Nút hủy giỏ hàng
+    if st.button("🗑️ Hủy giỏ hàng"):
+        st.session_state.cart = []
+        st.rerun()
+
 # -------------------- KHÁCH HÀNG & CÔNG NỢ --------------------
 elif menu == "👥 Khách hàng & Công nợ":
     st.title("Quản lý khách hàng và công nợ")
@@ -703,6 +789,7 @@ elif menu == "👥 Khách hàng & Công nợ":
                 "ID": c.id,
                 "Tên": c.name,
                 "SĐT": c.phone,
+                "Địa chỉ": c.address,
                 "Tổng chi": f"{c.total_spent:,.0f}",
                 "Số lần mua": c.total_purchases,
                 "Loại": c.type,
@@ -715,8 +802,9 @@ elif menu == "👥 Khách hàng & Công nợ":
             with st.form("new_cust"):
                 name = st.text_input("Tên")
                 phone = st.text_input("Số điện thoại")
+                address = st.text_input("Địa chỉ")
                 if st.form_submit_button("Thêm"):
-                    add_customer(name, phone)
+                    add_customer(name, phone, address)
                     clear_cache()
                     st.success("Đã thêm")
                     st.rerun()
@@ -800,6 +888,17 @@ elif menu == "⚙️ Cài đặt (Admin)":
         st.warning("Chỉ admin mới có quyền")
     else:
         st.title("Cài đặt hệ thống")
+        # Import khách hàng thân thiết từ CSV
+        st.subheader("Import khách hàng thân thiết từ CSV")
+        csv_file = st.file_uploader("Chọn file CSV (cột: name, phone, address tùy chọn)", type=["csv"])
+        if st.button("Import CSV"):
+            if csv_file:
+                import_loyal_customers_from_csv(csv_file)
+            else:
+                st.error("Vui lòng chọn file CSV")
+
+        st.divider()
+        # Các cài đặt tham số
         settings = safe_query(get_settings_cached)
         key_labels = {
             "loyal_min_spent": "Chi tiêu tối thiểu (VNĐ) - Thân thiết",
