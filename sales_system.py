@@ -345,51 +345,78 @@ def get_payment_history(customer_id: int):
         return session.query(Payment).filter_by(customer_id=customer_id).order_by(Payment.payment_date).all()
 
 def import_loyal_customers_from_csv(file):
+    """
+    Nhập khách hàng thân thiết từ file CSV.
+    CSV phải có cột: name, phone (tùy chọn: address)
+    """
     if not file:
         st.error("Chưa chọn file CSV")
         return 0
-    
-    # Đọc với utf-8-sig để tự động loại bỏ BOM
+
+    # Đọc file CSV
     try:
         content = file.getvalue().decode("utf-8-sig")
     except UnicodeDecodeError:
-        st.error("File không đúng encoding UTF-8. Vui lòng lưu lại với UTF-8.")
+        st.error("File không đúng encoding UTF-8. Lưu lại với UTF-8.")
         return 0
-    
+
     lines = content.splitlines()
     if not lines:
         st.error("File rỗng")
         return 0
-    
-    # Dùng DictReader, delimiter mặc định là dấu phẩy
+
     reader = csv.DictReader(lines)
-    
-    # Kiểm tra xem có đúng các cột cần thiết không
-    if not all(k in reader.fieldnames for k in ['name', 'phone']):
-        st.warning(f"File thiếu cột 'name' hoặc 'phone'. Các cột tìm thấy: {reader.fieldnames}")
+    required_columns = ['name', 'phone']
+    if not all(col in reader.fieldnames for col in required_columns):
+        st.warning(f"File thiếu cột {required_columns}. Các cột tìm thấy: {reader.fieldnames}")
         return 0
-    
+
     added_count = 0
+    skipped_count = 0
     error_rows = []
+
     with SessionLocal() as session:
-        for idx, row in enumerate(reader, start=2):  # bắt đầu từ dòng 2 (sau header)
+        for idx, row in enumerate(reader, start=2):
             name = row.get("name", "").strip()
             phone = row.get("phone", "").strip()
-            address = row.get("address", "").strip()
+            address = row.get("address", "").strip() if "address" in row else ""
+
             if not name or not phone:
                 error_rows.append(idx)
                 continue
-            # Kiểm tra trùng SĐT
-            if session.query(Customer).filter_by(phone=phone).first():
-                continue
+
             try:
+                # Tắt autoflush để query mà không flush session đang thêm mới
+                with session.no_autoflush:
+                    existing = session.query(Customer).filter_by(phone=phone).first()
+                if existing:
+                    skipped_count += 1
+                    continue
+
                 cust = Customer(name=name, phone=phone, address=address, type='loyal')
                 session.add(cust)
                 added_count += 1
             except Exception as e:
                 error_rows.append(idx)
-                st.error(f"Lỗi khi thêm dòng {idx}: {e}")
-        session.commit()
+                st.error(f"Lỗi thêm dòng {idx}: {e}")
+
+        try:
+            session.commit()
+        except IntegrityError as e:
+            session.rollback()
+            st.error(f"Lỗi database khi commit: {e}")
+
+    # Thông báo kết quả
+    if added_count > 0:
+        st.success(f"✅ Đã thêm {added_count} khách hàng thân thiết")
+    if skipped_count > 0:
+        st.info(f"⚠ Bỏ qua {skipped_count} khách đã tồn tại theo số điện thoại")
+    if error_rows:
+        st.warning(f"⚠ Dữ liệu lỗi ở các dòng: {error_rows[:10]}...")
+
+    # Xóa cache để cập nhật danh sách khách
+    clear_cache()
+    return added_count
     
     if error_rows:
         st.warning(f"Bỏ qua {len(error_rows)} dòng lỗi (thiếu tên/SĐT hoặc lỗi khác) tại các dòng: {error_rows[:10]}...")
