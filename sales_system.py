@@ -345,28 +345,59 @@ def get_payment_history(customer_id: int):
         return session.query(Payment).filter_by(customer_id=customer_id).order_by(Payment.payment_date).all()
 
 def import_loyal_customers_from_csv(file):
-    """Import khách hàng thân thiết từ CSV (cột name, phone, address tùy chọn)."""
     if not file:
         st.error("Chưa chọn file CSV")
         return 0
+    
+    # Đọc với utf-8-sig để tự động loại bỏ BOM
+    try:
+        content = file.getvalue().decode("utf-8-sig")
+    except UnicodeDecodeError:
+        st.error("File không đúng encoding UTF-8. Vui lòng lưu lại với UTF-8.")
+        return 0
+    
+    lines = content.splitlines()
+    if not lines:
+        st.error("File rỗng")
+        return 0
+    
+    # Dùng DictReader, delimiter mặc định là dấu phẩy
+    reader = csv.DictReader(lines)
+    
+    # Kiểm tra xem có đúng các cột cần thiết không
+    if not all(k in reader.fieldnames for k in ['name', 'phone']):
+        st.warning(f"File thiếu cột 'name' hoặc 'phone'. Các cột tìm thấy: {reader.fieldnames}")
+        return 0
+    
     added_count = 0
-    decoded = file.getvalue().decode("utf-8").splitlines()
-    reader = csv.DictReader(decoded)
+    error_rows = []
     with SessionLocal() as session:
-        for row in reader:
+        for idx, row in enumerate(reader, start=2):  # bắt đầu từ dòng 2 (sau header)
             name = row.get("name", "").strip()
             phone = row.get("phone", "").strip()
             address = row.get("address", "").strip()
             if not name or not phone:
+                error_rows.append(idx)
                 continue
             # Kiểm tra trùng SĐT
             if session.query(Customer).filter_by(phone=phone).first():
                 continue
-            cust = Customer(name=name, phone=phone, address=address, type='loyal')
-            session.add(cust)
-            added_count += 1
+            try:
+                cust = Customer(name=name, phone=phone, address=address, type='loyal')
+                session.add(cust)
+                added_count += 1
+            except Exception as e:
+                error_rows.append(idx)
+                st.error(f"Lỗi khi thêm dòng {idx}: {e}")
         session.commit()
-    st.success(f"✅ Đã thêm {added_count} khách hàng thân thiết từ CSV")
+    
+    if error_rows:
+        st.warning(f"Bỏ qua {len(error_rows)} dòng lỗi (thiếu tên/SĐT hoặc lỗi khác) tại các dòng: {error_rows[:10]}...")
+    if added_count == 0:
+        st.warning("Không có khách hàng nào được thêm. Kiểm tra lại định dạng file (cột name, phone) và dữ liệu.")
+    else:
+        st.success(f"✅ Đã thêm {added_count} khách hàng thân thiết từ CSV")
+    
     clear_cache()
     return added_count
 
