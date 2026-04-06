@@ -350,10 +350,10 @@ def get_payment_history(customer_id: int):
 def import_customers_from_csv(file, batch_size=100):
     """
     Nhập khách hàng từ CSV:
-    - CSV có cột bắt buộc: name, phone
+    - CSV bắt buộc có cột: name, phone
     - Có thể thêm cột address
     - Tự động check trùng số điện thoại
-    - Khách mới mua sẽ được lưu vào hệ thống
+    - Khách mới mua sẽ được lưu vào hệ thống với type='loyal'
     """
     if not file:
         st.error("Chưa chọn file CSV")
@@ -403,7 +403,7 @@ def import_customers_from_csv(file, batch_size=100):
                 skipped_count += 1
                 continue
 
-            cust = Customer(name=name, phone=phone, address=address, type='loyal')  # type = 'loyal' cho khách thân
+            cust = Customer(name=name, phone=phone, address=address, type='loyal')
             batch.append(cust)
             existing_phones.add(phone)
 
@@ -432,7 +432,7 @@ def import_customers_from_csv(file, batch_size=100):
                 st.error(f"Lỗi commit batch cuối: {e}")
 
     # Báo cáo
-    st.success(f"✅ Đã thêm {added_count} khách hàng")
+    st.success(f"✅ Đã thêm {added_count} khách hàng thân thiết")
     if skipped_count > 0:
         st.info(f"⚠ Bỏ qua {skipped_count} khách đã tồn tại theo số điện thoại")
     if error_rows:
