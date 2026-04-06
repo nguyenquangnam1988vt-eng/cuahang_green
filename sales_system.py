@@ -15,17 +15,27 @@ from dotenv import load_dotenv
 from typing import List, Dict, Optional
 
 # ---------- LOAD BIẾN MÔI TRƯỜNG ----------
-load_dotenv()
-DATABASE_URL = os.getenv("DATABASE_URL")
-CLOUD_NAME = os.getenv("CLOUD_NAME")
-API_KEY = os.getenv("API_KEY")
-API_SECRET = os.getenv("API_SECRET")
-
-if not all([DATABASE_URL, CLOUD_NAME, API_KEY, API_SECRET]):
-    st.error("❌ Bạn chưa set DATABASE_URL hoặc Cloudinary API KEY/SECRET")
-    st.stop()
-
-cloudinary.config(cloud_name=CLOUD_NAME, api_key=API_KEY, api_secret=API_SECRET)
+if os.environ.get('STREAMLIT_CLOUD') or os.environ.get('STREAMLIT_RUNTIME'):
+    # Trên Streamlit Cloud: ưu tiên dùng st.secrets
+    try:
+        DATABASE_URL = st.secrets["DATABASE_URL"]
+        CLOUD_NAME = st.secrets["CLOUD_NAME"]
+        API_KEY = st.secrets["API_KEY"]
+        API_SECRET = st.secrets["API_SECRET"]
+    except:
+        st.error("❌ Thiếu secrets trên Streamlit Cloud. Vui lòng cấu hình trong 'Secrets'.")
+        st.stop()
+else:
+    # Chạy local: đọc từ file .env
+    from dotenv import load_dotenv
+    load_dotenv()
+    DATABASE_URL = os.getenv("DATABASE_URL")
+    CLOUD_NAME = os.getenv("CLOUD_NAME")
+    API_KEY = os.getenv("API_KEY")
+    API_SECRET = os.getenv("API_SECRET")
+    if not all([DATABASE_URL, CLOUD_NAME, API_KEY, API_SECRET]):
+        st.error("❌ Bạn chưa set DATABASE_URL hoặc Cloudinary API trong file .env")
+        st.stop()
 
 # ---------- CẤU HÌNH DATABASE ----------
 Base = declarative_base()
