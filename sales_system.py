@@ -802,8 +802,17 @@ elif menu == "📦 Quản lý sản phẩm":
                     st.error("Lỗi khi nhập kho")
 
 # -------------------- BÁN HÀNG (CẢI TIẾN) --------------------
+# -------------------- BÁN HÀNG (CẢI TIẾN, SỬA LỖI TRA CỨU) --------------------
 elif menu == "🛒 Bán hàng":
     st.title("Bán hàng")
+
+    # Khởi tạo session_state cho thông tin khách hàng nếu chưa có
+    if 'cust_phone' not in st.session_state:
+        st.session_state.cust_phone = ""
+    if 'cust_name' not in st.session_state:
+        st.session_state.cust_name = ""
+    if 'cust_address' not in st.session_state:
+        st.session_state.cust_address = ""
 
     # Phần giỏ hàng
     st.subheader("Giỏ hàng")
@@ -812,20 +821,18 @@ elif menu == "🛒 Bán hàng":
         df_cart["Thành tiền"] = df_cart["price"] * df_cart["quantity"]
         st.dataframe(df_cart[["name", "quantity", "price", "Thành tiền"]])
         total = sum(item['price']*item['quantity'] for item in st.session_state.cart)
-
-        # Hiển thị tổng tiền tạm tính (chưa giảm giá)
         st.metric("Tổng tiền hàng", f"{total:,.0f} VNĐ")
     else:
         st.info("Giỏ hàng trống")
 
-    # Form thông tin khách hàng (luôn hiển thị)
+    # Form thông tin khách hàng
     st.subheader("Thông tin khách hàng")
     with st.form("customer_info"):
-        phone = st.text_input("📞 Số điện thoại", placeholder="Nhập số điện thoại để tra cứu")
-        # Khi nhập phone, có thể tra cứu tự động bằng session state, nhưng vì trong form nên dùng nút bấm
-        # Hoặc dùng st.form_submit_button và xử lý bên ngoài. Tạm thời để đơn giản, cho phép nhập tên và địa chỉ.
-        name = st.text_input("👤 Tên khách hàng")
-        address = st.text_input("🏠 Địa chỉ")
+        # Lấy giá trị từ session_state làm giá trị mặc định
+        phone = st.text_input("📞 Số điện thoại", value=st.session_state.cust_phone, placeholder="Nhập số điện thoại để tra cứu")
+        name = st.text_input("👤 Tên khách hàng", value=st.session_state.cust_name)
+        address = st.text_input("🏠 Địa chỉ", value=st.session_state.cust_address)
+        
         col_btn1, col_btn2 = st.columns(2)
         with col_btn1:
             search_btn = st.form_submit_button("🔍 Tra cứu")
@@ -833,37 +840,42 @@ elif menu == "🛒 Bán hàng":
             submit_btn = st.form_submit_button("✅ Thanh toán", type="primary")
 
     # Xử lý tra cứu khách hàng
-    if search_btn and phone:
-        with SessionLocal() as session:
-            cust = session.query(Customer).filter_by(phone=phone).first()
-            if cust:
-                st.success(f"Tìm thấy: {cust.name} - Loại: {cust.type} - Nợ: {cust.debt:,.0f}đ")
-                # Gợi ý điền tên và địa chỉ
-                st.session_state.cust_name = cust.name
-                st.session_state.cust_address = cust.address
-                st.rerun()
-            else:
-                st.warning("Khách hàng chưa có trong hệ thống. Vui lòng nhập tên và địa chỉ để tạo mới.")
-
-    # Nếu đã có session_state từ tra cứu, hiển thị lại
-    if 'cust_name' in st.session_state:
-        name = st.session_state.cust_name
-        address = st.session_state.cust_address
-    else:
-        name = name if 'name' in locals() else ""
-        address = address if 'address' in locals() else ""
+    if search_btn:
+        if phone.strip():
+            with SessionLocal() as session:
+                cust = session.query(Customer).filter_by(phone=phone.strip()).first()
+                if cust:
+                    # Lưu thông tin vào session_state
+                    st.session_state.cust_phone = cust.phone
+                    st.session_state.cust_name = cust.name
+                    st.session_state.cust_address = cust.address or ""
+                    st.success(f"✅ Tìm thấy: {cust.name} - Loại: {cust.type} - Nợ: {cust.debt:,.0f}đ")
+                else:
+                    st.warning("⚠️ Khách hàng chưa có trong hệ thống. Vui lòng nhập tên và địa chỉ để tạo mới.")
+                    # Vẫn giữ số điện thoại đã nhập
+                    st.session_state.cust_phone = phone.strip()
+                    st.session_state.cust_name = ""
+                    st.session_state.cust_address = ""
+            st.rerun()
+        else:
+            st.warning("Vui lòng nhập số điện thoại để tra cứu.")
 
     # Xử lý thanh toán
     if submit_btn:
+        # Lấy giá trị hiện tại từ form (có thể đã được sửa sau tra cứu)
+        current_phone = phone.strip()
+        current_name = name.strip()
+        current_address = address.strip()
+        
         if not st.session_state.cart:
             st.error("Giỏ hàng trống, không thể thanh toán.")
-        elif not phone:
+        elif not current_phone:
             st.error("Vui lòng nhập số điện thoại khách hàng.")
-        elif not name:
+        elif not current_name:
             st.error("Vui lòng nhập tên khách hàng (hoặc tra cứu trước).")
         else:
             # Tạo hoặc lấy customer_id
-            customer_id = get_or_create_customer(name, phone, address)
+            customer_id = get_or_create_customer(current_name, current_phone, current_address)
             # Lấy thông tin khách sau khi tạo/lấy
             with SessionLocal() as session:
                 cust = session.get(Customer, customer_id)
@@ -893,17 +905,17 @@ elif menu == "🛒 Bán hàng":
                                                             st.session_state.cart, total, discount_amount, final_amt, paid_amount, debt_after)
                             st.download_button("📥 Tải hóa đơn PDF", pdf_file, file_name=f"invoice_{sale_id}.pdf", mime="application/pdf")
                             st.success(f"Thanh toán thành công! Mã hóa đơn: {sale_id}. Công nợ mới: {debt_after:,.0f}đ")
-                            # Xóa giỏ hàng và reset session
+                            # Xóa giỏ hàng và reset thông tin khách trong session_state
                             st.session_state.cart = []
-                            if 'cust_name' in st.session_state:
-                                del st.session_state.cust_name
-                                del st.session_state.cust_address
+                            st.session_state.cust_phone = ""
+                            st.session_state.cust_name = ""
+                            st.session_state.cust_address = ""
                             clear_cache()
                             st.rerun()
                         except Exception as e:
                             st.error(f"Lỗi khi ghi nhận bán hàng: {e}")
 
-    # Khu vực thêm sản phẩm (luôn hiển thị)
+    # Khu vực thêm sản phẩm vào giỏ
     st.subheader("Thêm sản phẩm vào giỏ")
     search = st.text_input("🔍 Tìm kiếm (tên/mã vạch)", key="search_sale")
     products = safe_query(get_all_products_cached, search)
