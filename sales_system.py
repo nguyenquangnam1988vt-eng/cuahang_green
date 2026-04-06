@@ -347,7 +347,7 @@ def get_payment_history(customer_id: int):
     with SessionLocal() as session:
         return session.query(Payment).filter_by(customer_id=customer_id).order_by(Payment.payment_date).all()
 
-def import_customers_from_csv(file, batch_size=100):
+def import_customers_from_csv(file):
     """
     Nhập khách hàng từ CSV:
     - CSV bắt buộc có cột: name, phone
