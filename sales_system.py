@@ -14,6 +14,10 @@ import io
 from dotenv import load_dotenv
 from typing import List, Dict, Optional
 
+# ---------- CẤU HÌNH STREAMLIT ----------
+st.set_page_config(page_title="Hệ thống bán hàng Pro", layout="wide")
+st.set_option('browser.gatherUsageStats', False)   # Tắt gửi thống kê ẩn danh
+
 # ---------- LOAD BIẾN MÔI TRƯỜNG ----------
 if os.environ.get('STREAMLIT_CLOUD') or os.environ.get('STREAMLIT_RUNTIME'):
     try:
@@ -25,7 +29,6 @@ if os.environ.get('STREAMLIT_CLOUD') or os.environ.get('STREAMLIT_RUNTIME'):
         st.error("❌ Thiếu secrets trên Streamlit Cloud. Vui lòng cấu hình trong 'Secrets'.")
         st.stop()
 else:
-    from dotenv import load_dotenv
     load_dotenv()
     DATABASE_URL = os.getenv("DATABASE_URL")
     CLOUD_NAME = os.getenv("CLOUD_NAME")
@@ -35,12 +38,33 @@ else:
         st.error("❌ Bạn chưa set DATABASE_URL hoặc Cloudinary API trong file .env")
         st.stop()
 
-# ---------- CẤU HÌNH DATABASE ----------
-Base = declarative_base()
-engine = create_engine(DATABASE_URL, echo=False, future=True)
-SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+# ---------- CẤU HÌNH CLOUDINARY (CACHE) ----------
+@st.cache_resource
+def init_cloudinary():
+    cloudinary.config(
+        cloud_name=CLOUD_NAME,
+        api_key=API_KEY,
+        api_secret=API_SECRET
+    )
+    return True
+
+init_cloudinary()
+
+# ---------- CẤU HÌNH DATABASE (CACHE) ----------
+@st.cache_resource
+def get_engine():
+    return create_engine(DATABASE_URL, echo=False, future=True)
+
+@st.cache_resource
+def get_session_local():
+    return sessionmaker(bind=get_engine(), expire_on_commit=False)
+
+engine = get_engine()
+SessionLocal = get_session_local()
 
 # ---------- MODELS ----------
+Base = declarative_base()
+
 class User(Base):
     __tablename__ = "users"
     username = Column(String, primary_key=True)
@@ -51,8 +75,8 @@ class Product(Base):
     __tablename__ = "products"
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
-    price = Column(Float, nullable=False)          # Giá bán
-    cost = Column(Float, default=0.0)              # Giá vốn bình quân
+    price = Column(Float, nullable=False)
+    cost = Column(Float, default=0.0)
     stock = Column(Integer, nullable=False)
     image_url = Column(String)
     barcode = Column(String, unique=True, nullable=True)
@@ -61,8 +85,8 @@ class InventoryTransaction(Base):
     __tablename__ = "inventory_transactions"
     id = Column(Integer, primary_key=True)
     product_id = Column(Integer, ForeignKey("products.id"))
-    quantity = Column(Integer)      # Dương = nhập, Âm = xuất
-    price = Column(Float)           # Giá tại thời điểm nhập/xuất (giá nhập hoặc giá bán)
+    quantity = Column(Integer)
+    price = Column(Float)
     transaction_date = Column(DateTime, default=datetime.now)
     note = Column(String, nullable=True)
     sale_id = Column(Integer, ForeignKey("sales.id"), nullable=True)
@@ -81,7 +105,7 @@ class Payment(Base):
     __tablename__ = "payments"
     id = Column(Integer, primary_key=True)
     customer_id = Column(Integer, ForeignKey("customers.id"))
-    amount = Column(Float)          # Số tiền thanh toán (dương)
+    amount = Column(Float)
     payment_date = Column(DateTime, default=datetime.now)
     note = Column(String, nullable=True)
 
@@ -140,9 +164,13 @@ init_data()
 def upload_image_to_cloudinary(image_file):
     if image_file is None:
         return ""
-    result = cloudinary.uploader.upload(image_file, folder="sales_app",
-                                        transformation=[{"width": 500, "height": 500, "crop": "limit"}])
-    return result.get("secure_url", "")
+    try:
+        result = cloudinary.uploader.upload(image_file, folder="sales_app",
+                                            transformation=[{"width": 500, "height": 500, "crop": "limit"}])
+        return result.get("secure_url", "")
+    except Exception as e:
+        st.error(f"Lỗi upload ảnh: {e}")
+        return ""
 
 # ---------- QUẢN LÝ SẢN PHẨM ----------
 def add_product(name: str, price: float, cost: float, stock: int, image_file=None, barcode=None):
@@ -252,22 +280,15 @@ def get_payment_history(customer_id: int):
 
 # ---------- BÁN HÀNG ----------
 def record_sale(customer_id: int, cart_items: List[Dict], discount_percent: float, paid_amount: float = 0):
-    """
-    cart_items: list of dicts with keys: product_id, quantity, price (giá bán)
-    Trả về (sale_id, final_amount, debt_after)
-    """
     with SessionLocal() as session:
-        # 1. Kiểm tra tồn kho
         for item in cart_items:
             product = session.get(Product, item['product_id'])
             if not product or product.stock < item['quantity']:
-                raise ValueError(f"Sản phẩm {product.name if product else '?'} không đủ hàng (còn {product.stock if product else 0})")
+                raise ValueError(f"Sản phẩm {product.name if product else '?'} không đủ hàng")
         total = sum(item['price'] * item['quantity'] for item in cart_items)
         discount_amount = total * discount_percent / 100
         final = total - discount_amount
-        debt = final - paid_amount
-        if debt < 0:
-            debt = 0
+        debt = max(0, final - paid_amount)
         cust = session.get(Customer, customer_id)
         old_debt = cust.debt if cust else 0
         new_debt = old_debt + debt
@@ -275,7 +296,6 @@ def record_sale(customer_id: int, cart_items: List[Dict], discount_percent: floa
                     final_amount=final, paid_amount=paid_amount, debt_after=new_debt)
         session.add(sale)
         session.flush()
-        # 2. Trừ kho và ghi nhận giao dịch
         for item in cart_items:
             product = session.get(Product, item['product_id'])
             product.stock -= item['quantity']
@@ -293,13 +313,19 @@ def record_sale(customer_id: int, cart_items: List[Dict], discount_percent: floa
         update_customer_type(customer_id)
         return sale.id, final, new_debt
 
-# ---------- CÁC HÀM LẤY DỮ LIỆU CÓ CACHE ----------
+# ---------- CÁC HÀM LẤY DỮ LIỆU CÓ CACHE (ĐÃ SỬA FILTER) ----------
 @st.cache_data(ttl=30)
 def get_all_products_cached(search_term=""):
     with SessionLocal() as session:
         query = session.query(Product)
         if search_term:
-            query = query.filter(or_(Product.name.contains(search_term), Product.barcode.contains(search_term)))
+            # Tránh lỗi khi barcode None bằng cách kiểm tra riêng
+            query = query.filter(
+                or_(
+                    Product.name.contains(search_term),
+                    Product.barcode.isnot(None) & Product.barcode.contains(search_term)
+                )
+            )
         return query.all()
 
 @st.cache_data(ttl=60)
@@ -317,12 +343,9 @@ def get_sales_report(start_date=None, end_date=None):
     with SessionLocal() as session:
         query = session.query(Sale)
         if start_date:
-            # Chuyển date thành datetime để so sánh chính xác
-            start_datetime = datetime.combine(start_date, datetime.min.time())
-            query = query.filter(Sale.date >= start_datetime)
+            query = query.filter(func.date(Sale.date) >= start_date)
         if end_date:
-            end_datetime = datetime.combine(end_date, datetime.max.time())
-            query = query.filter(Sale.date <= end_datetime)
+            query = query.filter(func.date(Sale.date) <= end_date)
         return query.all()
 
 @st.cache_data(ttl=120)
@@ -378,9 +401,6 @@ def login(username, password):
     return None
 
 # ---------- STREAMLIT APP ----------
-st.set_page_config(page_title="Hệ thống bán hàng Pro", layout="wide")
-# ĐÃ XÓA DÒNG LỖI: st.set_option('client.displayEnabled', False)
-
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
     st.session_state.role = None
