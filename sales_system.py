@@ -76,7 +76,7 @@ class Product(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
     price = Column(Float, nullable=False)
-    cost = Column(Float, default=0.0)          # ← cột cost
+    cost = Column(Float, default=0.0)
     stock = Column(Integer, nullable=False)
     image_url = Column(String)
     barcode = Column(String, unique=True, nullable=True)
@@ -98,7 +98,7 @@ class Customer(Base):
     phone = Column(String, unique=True)
     total_spent = Column(Float, default=0)
     total_purchases = Column(Integer, default=0)
-    debt = Column(Float, default=0.0)          # ← cột debt
+    debt = Column(Float, default=0.0)
     type = Column(String, default='regular')
 
 class Payment(Base):
@@ -117,8 +117,8 @@ class Sale(Base):
     total_amount = Column(Float)
     discount = Column(Float)
     final_amount = Column(Float)
-    paid_amount = Column(Float, default=0.0)
-    debt_after = Column(Float, default=0.0)
+    paid_amount = Column(Float, default=0.0)   # ← cột mới
+    debt_after = Column(Float, default=0.0)    # ← cột mới
     customer = relationship("Customer")
 
 class SaleItem(Base):
@@ -137,9 +137,8 @@ class Setting(Base):
 # ---------- KIỂM TRA VÀ TẠO BẢNG/CỘT (AN TOÀN) ----------
 def ensure_tables_and_columns():
     """
-    Kiểm tra sự tồn tại của bảng products và customers,
-    đồng thời thêm cột cost (products) và debt (customers) nếu thiếu.
-    Sử dụng engine.begin() để tự động commit.
+    Kiểm tra sự tồn tại của bảng products, customers, sales
+    và thêm các cột cần thiết nếu thiếu.
     """
     inspector = inspect(engine)
     
@@ -151,7 +150,6 @@ def ensure_tables_and_columns():
                 conn.execute(text("ALTER TABLE products ADD COLUMN cost FLOAT DEFAULT 0.0"))
             st.info("✅ Đã thêm cột 'cost' vào bảng products.")
     else:
-        # Tạo bảng products nếu chưa có
         Base.metadata.tables['products'].create(engine, checkfirst=True)
         st.info("✅ Bảng 'products' được tạo mới (kèm cột cost).")
     
@@ -166,7 +164,20 @@ def ensure_tables_and_columns():
         Base.metadata.tables['customers'].create(engine, checkfirst=True)
         st.info("✅ Bảng 'customers' được tạo mới (kèm cột debt).")
     
-    # Có thể mở rộng thêm các bảng khác nếu cần
+    # Xử lý bảng sales
+    if 'sales' in inspector.get_table_names():
+        columns = [col['name'] for col in inspector.get_columns('sales')]
+        if 'paid_amount' not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE sales ADD COLUMN paid_amount FLOAT DEFAULT 0.0"))
+            st.info("✅ Đã thêm cột 'paid_amount' vào bảng sales.")
+        if 'debt_after' not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE sales ADD COLUMN debt_after FLOAT DEFAULT 0.0"))
+            st.info("✅ Đã thêm cột 'debt_after' vào bảng sales.")
+    else:
+        Base.metadata.tables['sales'].create(engine, checkfirst=True)
+        st.info("✅ Bảng 'sales' được tạo mới (kèm paid_amount, debt_after).")
 
 # Gọi hàm kiểm tra ngay sau khi có engine
 ensure_tables_and_columns()
