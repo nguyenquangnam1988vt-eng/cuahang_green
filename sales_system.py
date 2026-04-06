@@ -16,8 +16,7 @@ from dotenv import load_dotenv
 from typing import List, Dict, Optional
 import csv
 from sqlalchemy.orm import Session
-from models import Customer  # Model Customer của bạn
-from database import SessionLocal, clear_cache  # session và hàm clear_cache nếu có
+
 
 # ---------- CẤU HÌNH STREAMLIT ----------
 st.set_page_config(page_title="Hệ thống bán hàng Pro", layout="wide")
