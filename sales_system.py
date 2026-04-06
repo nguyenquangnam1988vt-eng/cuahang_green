@@ -16,7 +16,6 @@ from typing import List, Dict, Optional
 
 # ---------- LOAD BIẾN MÔI TRƯỜNG ----------
 if os.environ.get('STREAMLIT_CLOUD') or os.environ.get('STREAMLIT_RUNTIME'):
-    # Trên Streamlit Cloud: ưu tiên dùng st.secrets
     try:
         DATABASE_URL = st.secrets["DATABASE_URL"]
         CLOUD_NAME = st.secrets["CLOUD_NAME"]
@@ -26,7 +25,6 @@ if os.environ.get('STREAMLIT_CLOUD') or os.environ.get('STREAMLIT_RUNTIME'):
         st.error("❌ Thiếu secrets trên Streamlit Cloud. Vui lòng cấu hình trong 'Secrets'.")
         st.stop()
 else:
-    # Chạy local: đọc từ file .env
     from dotenv import load_dotenv
     load_dotenv()
     DATABASE_URL = os.getenv("DATABASE_URL")
@@ -42,7 +40,7 @@ Base = declarative_base()
 engine = create_engine(DATABASE_URL, echo=False, future=True)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
-# ---------- MODELS (BỔ SUNG BẢNG PAYMENT) ----------
+# ---------- MODELS ----------
 class User(Base):
     __tablename__ = "users"
     username = Column(String, primary_key=True)
@@ -188,7 +186,6 @@ def import_stock(product_id: int, quantity: int, import_price: float, note: str 
         product = session.get(Product, product_id)
         if not product:
             return False
-        # Tính giá vốn bình quân mới
         total_value = product.stock * product.cost
         new_total_value = total_value + (quantity * import_price)
         new_stock = product.stock + quantity
@@ -253,14 +250,14 @@ def get_payment_history(customer_id: int):
     with SessionLocal() as session:
         return session.query(Payment).filter_by(customer_id=customer_id).order_by(Payment.payment_date).all()
 
-# ---------- BÁN HÀNG (CÓ RACE CONDITION FIX) ----------
+# ---------- BÁN HÀNG ----------
 def record_sale(customer_id: int, cart_items: List[Dict], discount_percent: float, paid_amount: float = 0):
     """
     cart_items: list of dicts with keys: product_id, quantity, price (giá bán)
     Trả về (sale_id, final_amount, debt_after)
     """
     with SessionLocal() as session:
-        # 1. Kiểm tra tồn kho và khóa row nếu dùng PostgreSQL
+        # 1. Kiểm tra tồn kho
         for item in cart_items:
             product = session.get(Product, item['product_id'])
             if not product or product.stock < item['quantity']:
@@ -320,9 +317,12 @@ def get_sales_report(start_date=None, end_date=None):
     with SessionLocal() as session:
         query = session.query(Sale)
         if start_date:
-            query = query.filter(Sale.date >= start_date)
+            # Chuyển date thành datetime để so sánh chính xác
+            start_datetime = datetime.combine(start_date, datetime.min.time())
+            query = query.filter(Sale.date >= start_datetime)
         if end_date:
-            query = query.filter(Sale.date <= end_date)
+            end_datetime = datetime.combine(end_date, datetime.max.time())
+            query = query.filter(Sale.date <= end_datetime)
         return query.all()
 
 @st.cache_data(ttl=120)
@@ -379,7 +379,7 @@ def login(username, password):
 
 # ---------- STREAMLIT APP ----------
 st.set_page_config(page_title="Hệ thống bán hàng Pro", layout="wide")
-st.set_option('client.displayEnabled', False)
+# ĐÃ XÓA DÒNG LỖI: st.set_option('client.displayEnabled', False)
 
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
@@ -552,22 +552,26 @@ elif menu == "🛒 Bán hàng":
             if st.button("Thanh toán", use_container_width=True):
                 if not customer_id:
                     add_customer("Khách lẻ", "")
-                    new_cust = get_customers_cached()[-1]
-                    customer_id = new_cust.id
-                try:
-                    sale_id, final_amt, debt_after = record_sale(customer_id, st.session_state.cart, discount, paid)
-                    pdf_file = generate_pdf_invoice(sale_id,
-                                                     next((c.name for c in customers if c.id==customer_id), "Khách lẻ"),
-                                                     next((c.phone for c in customers if c.id==customer_id), ""),
-                                                     next((c.type for c in customers if c.id==customer_id), "regular"),
-                                                     st.session_state.cart, total, disc_amount, final_amt, paid, debt_after)
-                    st.download_button("📥 Tải hóa đơn PDF", pdf_file, file_name=f"invoice_{sale_id}.pdf", mime="application/pdf")
-                    st.success("Thanh toán thành công!")
-                    st.session_state.cart = []
                     clear_cache()
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Lỗi: {e}")
+                    customers = get_customers_cached()
+                    customer_id = customers[-1].id if customers else None
+                if customer_id:
+                    try:
+                        sale_id, final_amt, debt_after = record_sale(customer_id, st.session_state.cart, discount, paid)
+                        cust_name = next((c.name for c in customers if c.id==customer_id), "Khách lẻ")
+                        cust_phone = next((c.phone for c in customers if c.id==customer_id), "")
+                        cust_type = next((c.type for c in customers if c.id==customer_id), "regular")
+                        pdf_file = generate_pdf_invoice(sale_id, cust_name, cust_phone, cust_type,
+                                                         st.session_state.cart, total, disc_amount, final_amt, paid, debt_after)
+                        st.download_button("📥 Tải hóa đơn PDF", pdf_file, file_name=f"invoice_{sale_id}.pdf", mime="application/pdf")
+                        st.success("Thanh toán thành công!")
+                        st.session_state.cart = []
+                        clear_cache()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Lỗi: {e}")
+                else:
+                    st.error("Không thể tạo khách hàng")
         with colB:
             if st.button("Hủy giỏ hàng"):
                 st.session_state.cart = []
