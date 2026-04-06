@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import os
 import bcrypt
+import time
 from datetime import datetime, date
 from sqlalchemy import create_engine, Column, String, Integer, Float, DateTime, ForeignKey, Text, or_, func, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
@@ -75,7 +76,7 @@ class Product(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
     price = Column(Float, nullable=False)
-    cost = Column(Float, default=0.0)
+    cost = Column(Float, default=0.0)          # ← cột cost
     stock = Column(Integer, nullable=False)
     image_url = Column(String)
     barcode = Column(String, unique=True, nullable=True)
@@ -97,7 +98,7 @@ class Customer(Base):
     phone = Column(String, unique=True)
     total_spent = Column(Float, default=0)
     total_purchases = Column(Integer, default=0)
-    debt = Column(Float, default=0.0)
+    debt = Column(Float, default=0.0)          # ← cột debt
     type = Column(String, default='regular')
 
 class Payment(Base):
@@ -133,40 +134,45 @@ class Setting(Base):
     key = Column(String, primary_key=True)
     value = Column(String)
 
-# ---------- KIỂM TRA VÀ TẠO BẢNG (XỬ LÝ LỖI) ----------
-def create_tables_safe():
-    """Tạo bảng nếu chưa có, bắt lỗi và retry nếu cần."""
-    try:
-        Base.metadata.create_all(engine)
-        # Kiểm tra xem bảng products có tồn tại không
-        inspector = inspect(engine)
-        if 'products' not in inspector.get_table_names():
-            raise Exception("Bảng products chưa được tạo")
-    except Exception as e:
-        st.error(f"Lỗi khi tạo bảng: {e}. Thử lại...")
-        # Xóa cache engine và thử lại
-        st.cache_resource.clear()
-        time.sleep(1)
-        Base.metadata.create_all(engine)
+# ---------- KIỂM TRA VÀ TẠO BẢNG/CỘT (AN TOÀN) ----------
+def ensure_tables_and_columns():
+    """
+    Kiểm tra sự tồn tại của bảng products và customers,
+    đồng thời thêm cột cost (products) và debt (customers) nếu thiếu.
+    Sử dụng engine.begin() để tự động commit.
+    """
+    inspector = inspect(engine)
+    
+    # Xử lý bảng products
+    if 'products' in inspector.get_table_names():
+        columns = [col['name'] for col in inspector.get_columns('products')]
+        if 'cost' not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE products ADD COLUMN cost FLOAT DEFAULT 0.0"))
+            st.info("✅ Đã thêm cột 'cost' vào bảng products.")
+    else:
+        # Tạo bảng products nếu chưa có
+        Base.metadata.tables['products'].create(engine, checkfirst=True)
+        st.info("✅ Bảng 'products' được tạo mới (kèm cột cost).")
+    
+    # Xử lý bảng customers
+    if 'customers' in inspector.get_table_names():
+        columns = [col['name'] for col in inspector.get_columns('customers')]
+        if 'debt' not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE customers ADD COLUMN debt FLOAT DEFAULT 0.0"))
+            st.info("✅ Đã thêm cột 'debt' vào bảng customers.")
+    else:
+        Base.metadata.tables['customers'].create(engine, checkfirst=True)
+        st.info("✅ Bảng 'customers' được tạo mới (kèm cột debt).")
+    
+    # Có thể mở rộng thêm các bảng khác nếu cần
 
-# Gọi tạo bảng ngay khi khởi động
-create_tables_safe()
+# Gọi hàm kiểm tra ngay sau khi có engine
+ensure_tables_and_columns()
 
-# Kiểm tra và thêm cột debt nếu cần (cho database cũ)
-def ensure_schema_up_to_date():
-    try:
-        inspector = inspect(engine)
-        if 'customers' in inspector.get_table_names():
-            columns = [col['name'] for col in inspector.get_columns('customers')]
-            if 'debt' not in columns:
-                with engine.connect() as conn:
-                    conn.execute(text("ALTER TABLE customers ADD COLUMN debt FLOAT DEFAULT 0.0"))
-                    conn.commit()
-                    st.info("Đã thêm cột debt vào bảng customers (nâng cấp database).")
-    except Exception as e:
-        st.warning(f"Không thể cập nhật schema (có thể do quyền): {e}")
-
-ensure_schema_up_to_date()
+# Tạo các bảng còn lại nếu chưa có (không ảnh hưởng đến các bảng đã xử lý)
+Base.metadata.create_all(engine)
 
 # ---------- HÀM TIỆN ÍCH ----------
 def hash_password(password: str) -> str:
@@ -349,16 +355,14 @@ def record_sale(customer_id: int, cart_items: List[Dict], discount_percent: floa
         update_customer_type(customer_id)
         return sale.id, final, new_debt
 
-# ---------- CÁC HÀM LẤY DỮ LIỆU CÓ CACHE (CÓ XỬ LÝ LỖI PROGRAMMINGERROR) ----------
+# ---------- CÁC HÀM LẤY DỮ LIỆU CÓ CACHE (XỬ LÝ LỖI) ----------
 def safe_query(query_func, *args, **kwargs):
-    """Thực thi query, nếu gặp ProgrammingError thì clear cache và thử lại."""
     try:
         return query_func(*args, **kwargs)
     except ProgrammingError as e:
-        st.warning(f"Lỗi schema database: {e}. Đang xóa cache và thử lại...")
+        st.warning(f"Lỗi schema: {e}. Đang xóa cache và thử lại...")
         clear_cache()
-        # Tạo lại bảng nếu cần
-        create_tables_safe()
+        ensure_tables_and_columns()
         return query_func(*args, **kwargs)
 
 @st.cache_data(ttl=30)
@@ -476,22 +480,12 @@ menu = st.sidebar.radio("Chức năng", menu_options)
 if menu == "🏠 Trang chủ":
     st.title("Dashboard tổng quan")
     with SessionLocal() as session:
-        total_revenue = session.query(func.sum(Sale.final_amount)).scalar()
-        total_revenue = total_revenue if total_revenue is not None else 0.0
-        
-        total_customers = session.query(func.count(Customer.id)).scalar()
-        total_customers = total_customers if total_customers is not None else 0
-        
-        total_products = session.query(func.count(Product.id)).scalar()
-        total_products = total_products if total_products is not None else 0
-        
-        total_debt = session.query(func.sum(Customer.debt)).scalar()
-        total_debt = total_debt if total_debt is not None else 0.0
-        
+        total_revenue = session.query(func.sum(Sale.final_amount)).scalar() or 0.0
+        total_customers = session.query(func.count(Customer.id)).scalar() or 0
+        total_products = session.query(func.count(Product.id)).scalar() or 0
+        total_debt = session.query(func.sum(Customer.debt)).scalar() or 0.0
         today = date.today()
-        revenue_today = session.query(func.sum(Sale.final_amount)).filter(func.date(Sale.date) == today).scalar()
-        revenue_today = revenue_today if revenue_today is not None else 0.0
-        
+        revenue_today = session.query(func.sum(Sale.final_amount)).filter(func.date(Sale.date) == today).scalar() or 0.0
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Tổng doanh thu", f"{total_revenue:,.0f} VNĐ")
     col2.metric("Sản phẩm", total_products)
