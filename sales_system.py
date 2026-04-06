@@ -14,6 +14,10 @@ import plotly.express as px
 from fpdf import FPDF
 from dotenv import load_dotenv
 from typing import List, Dict, Optional
+import csv
+from sqlalchemy.orm import Session
+from models import Customer  # Model Customer của bạn
+from database import SessionLocal, clear_cache  # session và hàm clear_cache nếu có
 
 # ---------- CẤU HÌNH STREAMLIT ----------
 st.set_page_config(page_title="Hệ thống bán hàng Pro", layout="wide")
@@ -344,39 +348,50 @@ def get_payment_history(customer_id: int):
     with SessionLocal() as session:
         return session.query(Payment).filter_by(customer_id=customer_id).order_by(Payment.payment_date).all()
 
-def import_loyal_customers_from_csv(file):
+def import_customers_from_csv(file, batch_size=100):
     """
-    Nhập khách hàng thân thiết từ file CSV.
-    CSV phải có cột: name, phone (tùy chọn: address)
+    Nhập khách hàng từ CSV:
+    - CSV có cột bắt buộc: name, phone
+    - Có thể thêm cột address
+    - Tự động check trùng số điện thoại
+    - Khách mới mua sẽ được lưu vào hệ thống
     """
     if not file:
         st.error("Chưa chọn file CSV")
         return 0
 
-    # Đọc file CSV
     try:
         content = file.getvalue().decode("utf-8-sig")
     except UnicodeDecodeError:
-        st.error("File không đúng encoding UTF-8. Lưu lại với UTF-8.")
+        st.error("File không đúng encoding UTF-8. Lưu lại CSV với UTF-8.")
         return 0
 
     lines = content.splitlines()
     if not lines:
-        st.error("File rỗng")
+        st.error("File CSV rỗng")
         return 0
 
     reader = csv.DictReader(lines)
     required_columns = ['name', 'phone']
     if not all(col in reader.fieldnames for col in required_columns):
-        st.warning(f"File thiếu cột {required_columns}. Các cột tìm thấy: {reader.fieldnames}")
+        st.warning(f"CSV thiếu cột {required_columns}. Có các cột: {reader.fieldnames}")
         return 0
 
+    all_rows = list(reader)
+    total_rows = len(all_rows)
     added_count = 0
     skipped_count = 0
     error_rows = []
 
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
     with SessionLocal() as session:
-        for idx, row in enumerate(reader, start=2):
+        # Lấy tất cả số điện thoại hiện tại trong DB
+        existing_phones = set(r[0] for r in session.query(Customer.phone).all())
+
+        batch = []
+        for idx, row in enumerate(all_rows, start=2):
             name = row.get("name", "").strip()
             phone = row.get("phone", "").strip()
             address = row.get("address", "").strip() if "address" in row else ""
@@ -385,46 +400,45 @@ def import_loyal_customers_from_csv(file):
                 error_rows.append(idx)
                 continue
 
+            if phone in existing_phones:
+                skipped_count += 1
+                continue
+
+            cust = Customer(name=name, phone=phone, address=address, type='loyal')  # type = 'loyal' cho khách thân
+            batch.append(cust)
+            existing_phones.add(phone)
+
+            if len(batch) >= batch_size:
+                try:
+                    session.bulk_save_objects(batch)
+                    session.commit()
+                    added_count += len(batch)
+                    batch = []
+                except Exception as e:
+                    session.rollback()
+                    st.error(f"Lỗi commit batch tại dòng {idx}: {e}")
+
+            # Cập nhật tiến trình
+            progress_bar.progress(idx / total_rows)
+            status_text.text(f"Đang xử lý {idx}/{total_rows} dòng...")
+
+        # Commit batch cuối nếu còn
+        if batch:
             try:
-                # Tắt autoflush để query mà không flush session đang thêm mới
-                with session.no_autoflush:
-                    existing = session.query(Customer).filter_by(phone=phone).first()
-                if existing:
-                    skipped_count += 1
-                    continue
-
-                cust = Customer(name=name, phone=phone, address=address, type='loyal')
-                session.add(cust)
-                added_count += 1
+                session.bulk_save_objects(batch)
+                session.commit()
+                added_count += len(batch)
             except Exception as e:
-                error_rows.append(idx)
-                st.error(f"Lỗi thêm dòng {idx}: {e}")
+                session.rollback()
+                st.error(f"Lỗi commit batch cuối: {e}")
 
-        try:
-            session.commit()
-        except IntegrityError as e:
-            session.rollback()
-            st.error(f"Lỗi database khi commit: {e}")
-
-    # Thông báo kết quả
-    if added_count > 0:
-        st.success(f"✅ Đã thêm {added_count} khách hàng thân thiết")
+    # Báo cáo
+    st.success(f"✅ Đã thêm {added_count} khách hàng")
     if skipped_count > 0:
         st.info(f"⚠ Bỏ qua {skipped_count} khách đã tồn tại theo số điện thoại")
     if error_rows:
-        st.warning(f"⚠ Dữ liệu lỗi ở các dòng: {error_rows[:10]}...")
+        st.warning(f"⚠ Lỗi dữ liệu tại các dòng: {error_rows[:10]}...")
 
-    # Xóa cache để cập nhật danh sách khách
-    clear_cache()
-    return added_count
-    
-    if error_rows:
-        st.warning(f"Bỏ qua {len(error_rows)} dòng lỗi (thiếu tên/SĐT hoặc lỗi khác) tại các dòng: {error_rows[:10]}...")
-    if added_count == 0:
-        st.warning("Không có khách hàng nào được thêm. Kiểm tra lại định dạng file (cột name, phone) và dữ liệu.")
-    else:
-        st.success(f"✅ Đã thêm {added_count} khách hàng thân thiết từ CSV")
-    
     clear_cache()
     return added_count
 
