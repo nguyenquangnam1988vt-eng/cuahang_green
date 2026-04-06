@@ -5,7 +5,7 @@ import bcrypt
 from datetime import datetime, date
 from sqlalchemy import create_engine, Column, String, Integer, Float, DateTime, ForeignKey, Text, or_, func, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 import cloudinary
 import cloudinary.uploader
 import plotly.express as px
@@ -133,21 +133,39 @@ class Setting(Base):
     key = Column(String, primary_key=True)
     value = Column(String)
 
-# ---------- KIỂM TRA VÀ CẬP NHẬT SCHEMA (THÊM CỘT DEBT NẾU THIẾU) ----------
-def ensure_schema_up_to_date():
-    """Kiểm tra và thêm cột debt vào bảng customers nếu chưa có (cho database cũ)."""
-    inspector = inspect(engine)
-    if 'customers' in inspector.get_table_names():
-        columns = [col['name'] for col in inspector.get_columns('customers')]
-        if 'debt' not in columns:
-            with engine.connect() as conn:
-                conn.execute(text("ALTER TABLE customers ADD COLUMN debt FLOAT DEFAULT 0.0"))
-                conn.commit()
-                st.info("Đã thêm cột debt vào bảng customers (nâng cấp database).")
-    # Có thể thêm các cột khác nếu cần
+# ---------- KIỂM TRA VÀ TẠO BẢNG (XỬ LÝ LỖI) ----------
+def create_tables_safe():
+    """Tạo bảng nếu chưa có, bắt lỗi và retry nếu cần."""
+    try:
+        Base.metadata.create_all(engine)
+        # Kiểm tra xem bảng products có tồn tại không
+        inspector = inspect(engine)
+        if 'products' not in inspector.get_table_names():
+            raise Exception("Bảng products chưa được tạo")
+    except Exception as e:
+        st.error(f"Lỗi khi tạo bảng: {e}. Thử lại...")
+        # Xóa cache engine và thử lại
+        st.cache_resource.clear()
+        time.sleep(1)
+        Base.metadata.create_all(engine)
 
-# Tạo bảng nếu chưa có, sau đó kiểm tra schema
-Base.metadata.create_all(engine)
+# Gọi tạo bảng ngay khi khởi động
+create_tables_safe()
+
+# Kiểm tra và thêm cột debt nếu cần (cho database cũ)
+def ensure_schema_up_to_date():
+    try:
+        inspector = inspect(engine)
+        if 'customers' in inspector.get_table_names():
+            columns = [col['name'] for col in inspector.get_columns('customers')]
+            if 'debt' not in columns:
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE customers ADD COLUMN debt FLOAT DEFAULT 0.0"))
+                    conn.commit()
+                    st.info("Đã thêm cột debt vào bảng customers (nâng cấp database).")
+    except Exception as e:
+        st.warning(f"Không thể cập nhật schema (có thể do quyền): {e}")
+
 ensure_schema_up_to_date()
 
 # ---------- HÀM TIỆN ÍCH ----------
@@ -159,19 +177,23 @@ def verify_password(password: str, hashed: str) -> bool:
 
 def init_data():
     with SessionLocal() as session:
-        if not session.query(User).filter_by(username="admin").first():
-            admin = User(username="admin", password_hash=hash_password("admin123"), role="admin")
-            staff = User(username="staff", password_hash=hash_password("staff123"), role="staff")
-            session.add_all([admin, staff])
-        defaults = {
-            "loyal_min_spent": "5000000", "loyal_min_purchases": "10",
-            "longtime_min_spent": "2000000", "longtime_min_purchases": "5",
-            "loyal_discount": "5", "longtime_discount": "2", "regular_discount": "0"
-        }
-        for k, v in defaults.items():
-            if not session.query(Setting).filter_by(key=k).first():
-                session.add(Setting(key=k, value=v))
-        session.commit()
+        try:
+            if not session.query(User).filter_by(username="admin").first():
+                admin = User(username="admin", password_hash=hash_password("admin123"), role="admin")
+                staff = User(username="staff", password_hash=hash_password("staff123"), role="staff")
+                session.add_all([admin, staff])
+            defaults = {
+                "loyal_min_spent": "5000000", "loyal_min_purchases": "10",
+                "longtime_min_spent": "2000000", "longtime_min_purchases": "5",
+                "loyal_discount": "5", "longtime_discount": "2", "regular_discount": "0"
+            }
+            for k, v in defaults.items():
+                if not session.query(Setting).filter_by(key=k).first():
+                    session.add(Setting(key=k, value=v))
+            session.commit()
+        except ProgrammingError as e:
+            st.error(f"Lỗi database khi khởi tạo dữ liệu: {e}. Hãy kiểm tra kết nối và schema.")
+            st.stop()
 
 init_data()
 
@@ -327,7 +349,18 @@ def record_sale(customer_id: int, cart_items: List[Dict], discount_percent: floa
         update_customer_type(customer_id)
         return sale.id, final, new_debt
 
-# ---------- CÁC HÀM LẤY DỮ LIỆU CÓ CACHE (ĐÃ SỬA LỖI SCALAR NONE) ----------
+# ---------- CÁC HÀM LẤY DỮ LIỆU CÓ CACHE (CÓ XỬ LÝ LỖI PROGRAMMINGERROR) ----------
+def safe_query(query_func, *args, **kwargs):
+    """Thực thi query, nếu gặp ProgrammingError thì clear cache và thử lại."""
+    try:
+        return query_func(*args, **kwargs)
+    except ProgrammingError as e:
+        st.warning(f"Lỗi schema database: {e}. Đang xóa cache và thử lại...")
+        clear_cache()
+        # Tạo lại bảng nếu cần
+        create_tables_safe()
+        return query_func(*args, **kwargs)
+
 @st.cache_data(ttl=30)
 def get_all_products_cached(search_term=""):
     with SessionLocal() as session:
@@ -443,7 +476,6 @@ menu = st.sidebar.radio("Chức năng", menu_options)
 if menu == "🏠 Trang chủ":
     st.title("Dashboard tổng quan")
     with SessionLocal() as session:
-        # Sửa lỗi scalar None
         total_revenue = session.query(func.sum(Sale.final_amount)).scalar()
         total_revenue = total_revenue if total_revenue is not None else 0.0
         
@@ -489,7 +521,7 @@ elif menu == "📦 Quản lý sản phẩm":
     with tab1:
         st.subheader("Danh sách sản phẩm")
         search = st.text_input("Tìm kiếm theo tên hoặc mã vạch", key="search_prod")
-        products = get_all_products_cached(search)
+        products = safe_query(get_all_products_cached, search)
         if not products:
             st.info("Không có sản phẩm")
         else:
@@ -513,7 +545,7 @@ elif menu == "📦 Quản lý sản phẩm":
     with tab2:
         st.subheader("Thêm / Cập nhật sản phẩm")
         with st.form("product_form"):
-            products_list = get_all_products_cached()
+            products_list = safe_query(get_all_products_cached)
             product_options = ["-- Thêm mới --"] + [f"{p.id} - {p.name}" for p in products_list]
             selected = st.selectbox("Chọn sản phẩm để sửa", product_options)
             name = st.text_input("Tên sản phẩm")
@@ -539,7 +571,7 @@ elif menu == "📦 Quản lý sản phẩm":
                     st.error("Mã vạch đã tồn tại!")
     with tab3:
         st.subheader("Nhập kho (tăng số lượng, cập nhật giá vốn bình quân)")
-        products = get_all_products_cached()
+        products = safe_query(get_all_products_cached)
         if not products:
             st.warning("Chưa có sản phẩm nào")
         else:
@@ -560,7 +592,7 @@ elif menu == "📦 Quản lý sản phẩm":
 # -------------------- BÁN HÀNG --------------------
 elif menu == "🛒 Bán hàng":
     st.title("Bán hàng")
-    customers = get_customers_cached()
+    customers = safe_query(get_customers_cached)
     cust_options = {f"{c.name} - {c.phone} (nợ: {c.debt:,.0f}đ)": c.id for c in customers}
     cust_options["Khách lẻ (không lưu)"] = None
     selected_cust_label = st.selectbox("Chọn khách hàng", list(cust_options.keys()))
@@ -597,7 +629,7 @@ elif menu == "🛒 Bán hàng":
                 if not customer_id:
                     add_customer("Khách lẻ", "")
                     clear_cache()
-                    customers = get_customers_cached()
+                    customers = safe_query(get_customers_cached)
                     customer_id = customers[-1].id if customers else None
                 if customer_id:
                     try:
@@ -624,7 +656,7 @@ elif menu == "🛒 Bán hàng":
         st.info("Giỏ hàng trống")
     st.subheader("Thêm sản phẩm")
     search = st.text_input("Tìm kiếm (tên/mã vạch)", key="search_sale")
-    products = get_all_products_cached(search)
+    products = safe_query(get_all_products_cached, search)
     products_display = products[:20]
     cols = st.columns(4)
     for idx, p in enumerate(products_display):
@@ -660,7 +692,7 @@ elif menu == "👥 Khách hàng & Công nợ":
     st.title("Quản lý khách hàng và công nợ")
     tab1, tab2, tab3 = st.tabs(["Danh sách khách hàng", "Thanh toán công nợ", "Lịch sử thanh toán"])
     with tab1:
-        customers = get_customers_cached()
+        customers = safe_query(get_customers_cached)
         if customers:
             df_cust = pd.DataFrame([{
                 "ID": c.id,
@@ -685,7 +717,7 @@ elif menu == "👥 Khách hàng & Công nợ":
                     st.rerun()
     with tab2:
         st.subheader("Thanh toán công nợ")
-        customers = get_customers_cached()
+        customers = safe_query(get_customers_cached)
         if customers:
             cust_with_debt = [c for c in customers if c.debt > 0]
             if not cust_with_debt:
@@ -703,7 +735,7 @@ elif menu == "👥 Khách hàng & Công nợ":
                         st.error("Lỗi: số tiền vượt quá công nợ hoặc khách không tồn tại")
     with tab3:
         st.subheader("Lịch sử thanh toán của khách hàng")
-        customers = get_customers_cached()
+        customers = safe_query(get_customers_cached)
         if customers:
             selected_cust = st.selectbox("Chọn khách hàng", customers, format_func=lambda x: f"{x.name} - {x.phone}")
             payments = get_payment_history(selected_cust.id)
@@ -722,7 +754,7 @@ elif menu == "📊 Báo cáo":
     if report_type == "Doanh thu theo ngày":
         start = st.date_input("Từ ngày", value=date.today().replace(day=1))
         end = st.date_input("Đến ngày", value=date.today())
-        sales = get_sales_report(start, end)
+        sales = safe_query(get_sales_report, start, end)
         if sales:
             df = pd.DataFrame([(s.date.date(), s.final_amount) for s in sales], columns=["Ngày", "Doanh thu"])
             df = df.groupby("Ngày").sum().reset_index()
@@ -741,8 +773,8 @@ elif menu == "📊 Báo cáo":
         else:
             st.info("Chưa có dữ liệu")
     elif report_type == "Lịch sử nhập/xuất kho":
-        prod_id = st.selectbox("Chọn sản phẩm (tất cả)", options=[None] + [p.id for p in get_all_products_cached()], format_func=lambda x: "Tất cả" if x is None else next((p.name for p in get_all_products_cached() if p.id==x), ""))
-        transactions = get_inventory_transactions(prod_id)
+        prod_id = st.selectbox("Chọn sản phẩm (tất cả)", options=[None] + [p.id for p in safe_query(get_all_products_cached)], format_func=lambda x: "Tất cả" if x is None else next((p.name for p in safe_query(get_all_products_cached) if p.id==x), ""))
+        transactions = safe_query(get_inventory_transactions, prod_id)
         if transactions:
             df = pd.DataFrame([(t.transaction_date, t.product_id, t.quantity, t.price, t.note) for t in transactions],
                               columns=["Ngày", "Mã SP", "SL", "Giá", "Ghi chú"])
@@ -750,7 +782,7 @@ elif menu == "📊 Báo cáo":
         else:
             st.info("Chưa có giao dịch")
     else:
-        customers = get_customers_cached()
+        customers = safe_query(get_customers_cached)
         if customers:
             df_debt = pd.DataFrame([(c.name, c.phone, c.debt) for c in customers if c.debt > 0], columns=["Tên", "SĐT", "Công nợ"])
             st.dataframe(df_debt)
@@ -763,7 +795,7 @@ elif menu == "⚙️ Cài đặt (Admin)":
         st.warning("Chỉ admin mới có quyền")
     else:
         st.title("Cài đặt hệ thống")
-        settings = get_settings_cached()
+        settings = safe_query(get_settings_cached)
         key_labels = {
             "loyal_min_spent": "Chi tiêu tối thiểu (VNĐ) - Thân thiết",
             "loyal_min_purchases": "Số lần mua tối thiểu - Thân thiết",
