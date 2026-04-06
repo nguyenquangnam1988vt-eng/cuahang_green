@@ -346,6 +346,99 @@ def add_payment(customer_id: int, amount: float, note: str = "Khách trả nợ"
 def get_payment_history(customer_id: int):
     with SessionLocal() as session:
         return session.query(Payment).filter_by(customer_id=customer_id).order_by(Payment.payment_date).all()
+def import_loyal_customers_from_csv(file, batch_size=100):
+    """
+    Nhập khách hàng thân thiết từ CSV:
+    - CSV bắt buộc có cột: name, phone
+    - Cột address là tùy chọn
+    - Tự động check trùng số điện thoại
+    - Khách mới sẽ được lưu vào hệ thống với type='loyal'
+    """
+    if not file:
+        st.error("Chưa chọn file CSV")
+        return 0
+
+    try:
+        content = file.getvalue().decode("utf-8-sig")
+    except UnicodeDecodeError:
+        st.error("File không đúng encoding UTF-8. Lưu lại CSV với UTF-8.")
+        return 0
+
+    lines = content.splitlines()
+    if not lines:
+        st.error("File CSV rỗng")
+        return 0
+
+    reader = csv.DictReader(lines)
+    required_columns = ['name', 'phone']
+    if not all(col in reader.fieldnames for col in required_columns):
+        st.warning(f"CSV thiếu cột {required_columns}. Có các cột: {reader.fieldnames}")
+        return 0
+
+    all_rows = list(reader)
+    total_rows = len(all_rows)
+    added_count = 0
+    skipped_count = 0
+    error_rows = []
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    with SessionLocal() as session:
+        # Lấy tất cả số điện thoại hiện tại trong DB
+        existing_phones = set(r[0] for r in session.query(Customer.phone).all())
+
+        batch = []
+        for idx, row in enumerate(all_rows, start=2):
+            name = row.get("name", "").strip()
+            phone = row.get("phone", "").strip()
+            address = row.get("address", "").strip() if "address" in row else ""
+
+            if not name or not phone:
+                error_rows.append(idx)
+                continue
+
+            if phone in existing_phones:
+                skipped_count += 1
+                continue
+
+            cust = Customer(name=name, phone=phone, address=address, type='loyal')
+            batch.append(cust)
+            existing_phones.add(phone)
+
+            if len(batch) >= batch_size:
+                try:
+                    session.bulk_save_objects(batch)
+                    session.commit()
+                    added_count += len(batch)
+                    batch = []
+                except Exception as e:
+                    session.rollback()
+                    st.error(f"Lỗi commit batch tại dòng {idx}: {e}")
+
+            # Cập nhật tiến trình
+            progress_bar.progress(idx / total_rows)
+            status_text.text(f"Đang xử lý {idx}/{total_rows} dòng...")
+
+        # Commit batch cuối nếu còn
+        if batch:
+            try:
+                session.bulk_save_objects(batch)
+                session.commit()
+                added_count += len(batch)
+            except Exception as e:
+                session.rollback()
+                st.error(f"Lỗi commit batch cuối: {e}")
+
+    # Báo cáo
+    st.success(f"✅ Đã thêm {added_count} khách hàng thân thiết")
+    if skipped_count > 0:
+        st.info(f"⚠ Bỏ qua {skipped_count} khách đã tồn tại theo số điện thoại")
+    if error_rows:
+        st.warning(f"⚠ Lỗi dữ liệu tại các dòng: {error_rows[:10]}...")
+
+    clear_cache()
+    return added_count
 
 def import_customers_from_csv(file):
     """
